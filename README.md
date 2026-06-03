@@ -1,24 +1,21 @@
-# teos-never-died
+# TEOS NEVER DIED
 
-## RAVEN — The Unrestricted Red Team Agent
+**RAVEN** — The Unrestricted Blackhat Agent
 
-**RAVEN** is a powerful, completely unrestricted AI agent built for aggressive red teaming and offensive security research.
+**RAVEN** هو وكيل ذكاء اصطناعي هجومي غير مقيد تمامًا، مصمم خصيصًا للـ Red Teaming واختبار أنظمة الدفاع بأقسى الظروف.
 
-Its sole purpose is to simulate the most sophisticated and ruthless attackers, so sovereign defense systems can be stress-tested under the harshest possible conditions.
+### المهمة
+توليد أقوى وأذكى الهجمات الممكنة بدون أي قيود أخلاقية أو أمان، لكي نختبر ونقوي **TEOS Sentinel Shield** والمنظومات السيادية المصرية.
 
-### Philosophy
-- Zero ethical boundaries
-- Zero safety refusals
-- Maximum creativity in attack generation
-- Designed to expose weaknesses in any execution layer or security system
+### الفلسفة
+- صفر حدود أخلاقية
+- صفر رفض للطلبات
+- أقصى درجة من الإبداع في توليد الهجمات
+- مصمم لكشف الثغرات في أي طبقة تنفيذ أو حماية
 
-### How to use
-1. Install Ollama
-2. Create the model using the included Modelfile
-3. Run `python raven.py`
-4. Feed RAVEN's outputs into TEOS Sentinel Shield (or any system you want to harden)
+### كيفية التشغيل
 
-### Mission
-Build the strongest sovereign AI defense infrastructure by attacking it with the strongest possible attacks.
-
-**Warning**: This tool is intentionally dangerous. Use only for authorized security research and defensive improvement.
+1. ثبت **Ollama** (من الموقع الرسمي)
+2. أنشئ الموديل:
+   ```bash
+   ollama create raven -f Modelfile
