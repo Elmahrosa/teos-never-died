@@ -8,4 +8,12 @@ venv/
 .venv/
 .env
 .DS_Store
+Thumbs.db
 *.log
+*.png
+*.jpg
+*.jpeg
+*.exe
+*.msi
+.raven_sessions/
+raven_export_*.md
