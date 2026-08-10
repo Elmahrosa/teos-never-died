@@ -32,11 +32,17 @@ def auto_load():
     path = session_path("_autosave")
     if not os.path.exists(path):
         return None, []
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return data.get("model"), data.get("messages", [])
-
-
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[!] Failed to load session: {e}")
+        return None, []
+    model = data.get("model")
+    messages = data.get("messages", [])
+    if not isinstance(messages, list):
+        messages = []
+    return model, messages
 def now_str():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -263,3 +269,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
