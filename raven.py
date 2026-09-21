@@ -255,6 +255,11 @@ def main():
             if not args.no_save:
                 auto_save(messages, model)
             break
+        except EOFError:
+            print("\n[!] Input closed. Exiting.")
+            if not args.no_save:
+                auto_save(messages, model)
+            break
         except Exception as e:
             err = str(e).lower()
             print(f"\n[!] {e}")

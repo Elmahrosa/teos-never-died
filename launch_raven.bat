@@ -1,0 +1,60 @@
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+title RAVEN - Unrestricted Agent
+cd /d "C:\Users\Elmahrosa-Teos\Desktop\teos-never-died"
+
+set "PYEXE=C:\Users\Elmahrosa-Teos\AppData\Local\Programs\Python\Python312\python.exe"
+set "OLLAMA_EXE=C:\Users\Elmahrosa-Teos\AppData\Local\Programs\Ollama\ollama.exe"
+
+echo =======================================
+echo     RAVEN - Unrestricted Agent
+echo =======================================
+echo.
+
+REM --- Sanity checks ---
+where ollama >nul 2>nul
+if errorlevel 1 (
+  echo [!] Ollama not found on PATH.
+  echo     Install from https://ollama.com and re-run.
+  goto :end
+)
+
+if not exist "%PYEXE%" (
+  echo [!] Python not found at: %PYEXE%
+  goto :end
+)
+
+REM --- Ensure ollama daemon is reachable ---
+"%OLLAMA_EXE%" list >nul 2>nul
+if errorlevel 1 (
+  echo [*] Ollama daemon not responding. Starting it...
+  start "" "%OLLAMA_EXE%" serve
+  timeout /t 4 >nul
+)
+
+REM --- Health check: model present AND loadable ---
+REM `ollama show` succeeds only if the manifest exists AND its blobs are on disk.
+"%OLLAMA_EXE%" show raven >nul 2>nul
+if errorlevel 1 (
+  echo [*] Model 'raven' missing or broken. Building from Modelfile...
+  "%OLLAMA_EXE%" create raven -f Modelfile
+  if errorlevel 1 (
+    echo [!] Failed to build 'raven' model.
+    echo     Run manually: ollama create raven -f Modelfile
+    goto :end
+  )
+) else (
+  echo [*] Model 'raven' is healthy - skipping rebuild.
+)
+echo.
+
+REM --- Launch agent ---
+echo [*] Starting RAVEN ...
+"%PYEXE%" raven.py
+set RC=%ERRORLEVEL%
+
+:end
+echo.
+if not "%RC%"=="0" echo [!] RAVEN exited with code %RC%.
+pause
+endlocal
