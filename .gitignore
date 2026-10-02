@@ -16,6 +16,7 @@ Thumbs.db
 *.exe
 *.msi
 .raven_sessions/
+.raven_knowledge/
 raven_export_*.md
 
 # Local Ollama storage (stale leftovers from old setup; Ollama uses OLLAMA_MODELS path)
