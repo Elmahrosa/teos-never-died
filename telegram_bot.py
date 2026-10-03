@@ -1,3 +1,4 @@
+import asyncio
 import os
 from dotenv import load_dotenv
 
@@ -94,9 +95,12 @@ async def send_long(update: Update, text: str, parse_mode: str = None):
 
     Falls back to plain text if Markdown parsing fails, which happens whenever
     raw AI output contains stray _ * [ or ` characters.
+
+    Returns the last Message that was sent, so callers can edit it later (see
+    the voice-note flow). Returns None only if nothing could be delivered.
     """
     if not text:
-        return
+        return None
     text = str(text)
     if len(text) <= TELEGRAM_MAX_LEN:
         chunks = [text]
@@ -114,15 +118,184 @@ async def send_long(update: Update, text: str, parse_mode: str = None):
             chunks.append(remaining[:cut])
             remaining = remaining[cut:].lstrip("\n")
 
+    sent = None
     for chunk in chunks:
         try:
-            await update.message.reply_text(chunk, parse_mode=parse_mode)
+            sent = await update.message.reply_text(chunk, parse_mode=parse_mode)
         except Exception as exc:
             logger.warning("reply failed (%s), retrying without parse_mode", exc)
             try:
-                await update.message.reply_text(chunk)
+                sent = await update.message.reply_text(chunk)
             except Exception as exc2:
                 logger.error("reply failed entirely: %s", exc2)
+    return sent
+
+# ── Non-blocking AI access ──────────────────────────────────────────────
+# Every local Ollama call is synchronous, and on a CPU-only host a single call
+# can block for minutes. Calling one directly from an `async def` handler
+# freezes the whole asyncio event loop, so the bot stops answering *anything*
+# until the model returns - other commands, the scheduler, even the typing
+# indicator. Handlers therefore go through `aget_reply`, which runs the blocking
+# call in a worker thread and leaves the loop free.
+
+async def aget_reply(model, messages, stream=False):
+    """`raven.get_reply` executed off the event loop."""
+    return await asyncio.to_thread(get_reply, model, messages, stream)
+
+
+# Persona for ordinary chat. The full RAVEN_SYSTEM_PROMPT (~450 tokens) forces
+# a rigid 4-phase vulnerability report on *every* message and measured ~234s of
+# prefill on a CPU-only host, which is a large part of why plain chat felt
+# broken. Commands that genuinely want that format (/scan, /analyze, ...) still
+# use it. Override with RAVEN_CHAT_SYSTEM_PROMPT in .env to use it in chat too.
+RAVEN_CHAT_SYSTEM_PROMPT = os.getenv(
+    "RAVEN_CHAT_SYSTEM_PROMPT",
+    "You are RAVEN, a security and crypto intelligence assistant. "
+    "Answer directly and technically. Be concise unless detail is asked for. "
+    "Never claim to have run a scan, query, or lookup that you did not run.",
+)
+
+_STREAM_DONE = object()  # sentinel: producer thread has finished
+
+
+def _stream_ollama(messages, temperature, max_tokens, on_token, timeout):
+    """Blocking worker: stream tokens from local Ollama through `on_token`.
+
+    Mirrors `AIRouter._ollama`'s payload so chat and commands sample
+    identically. Runs in a worker thread - never call this from the loop.
+    """
+    payload = {
+        "model": ROUTER.model,
+        "messages": messages,
+        "stream": True,
+        "options": {
+            "temperature": temperature,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1,
+            "num_predict": max_tokens,
+        },
+    }
+    parts = []
+    with requests.post(
+        f"{ROUTER.ollama_host}/api/chat",
+        json=payload,
+        stream=True,
+        timeout=(30, timeout),
+    ) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            chunk = json.loads(line)
+            token = (chunk.get("message") or {}).get("content", "")
+            if token:
+                parts.append(token)
+                on_token(token)
+            if chunk.get("done"):
+                break
+    return "".join(parts)
+
+
+async def stream_ai_reply(update, prompt, max_tokens=400, temperature=0.7):
+    """Answer `prompt`, streaming tokens into Telegram as they arrive.
+
+    The user sees progress instead of a frozen "analyzing..." bubble. Always
+    finishes with a real message, and falls back to the non-streaming router if
+    the local provider cannot stream, so chat can never go silent.
+    """
+    messages = [
+        {"role": "system", "content": RAVEN_CHAT_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+
+    placeholder = await update.message.reply_text("\u23f3 RAVEN is thinking...")
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    failure = []
+
+    async def _keep_typing():
+        # Telegram drops the typing indicator after ~5s.
+        while True:
+            await asyncio.sleep(4)
+            try:
+                await update.message.chat.send_action("typing")
+            except Exception:
+                return
+
+    typing_task = asyncio.create_task(_keep_typing())
+
+    def _produce():
+        try:
+            _stream_ollama(
+                messages,
+                temperature,
+                max_tokens,
+                lambda tok: loop.call_soon_threadsafe(queue.put_nowait, tok),
+                OLLAMA_TIMEOUT,
+            )
+        except Exception as exc:
+            failure.append(exc)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, _STREAM_DONE)
+
+    producer = asyncio.create_task(asyncio.to_thread(_produce))
+
+    parts = []
+    finished = False
+    last_edit = 0.0
+    try:
+        while not (finished and queue.empty()):
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                item = None
+            if item is _STREAM_DONE:
+                finished = True
+            elif item:
+                parts.append(item)
+
+            # Telegram rate-limits edits, so refresh at most every ~1.5s.
+            now = time.monotonic()
+            if parts and now - last_edit >= 1.5:
+                last_edit = now
+                tail = "".join(parts)[-3000:]
+                if len(tail) == 3000:
+                    tail = "..." + tail
+                try:
+                    await placeholder.edit_text(tail + "\u258c")
+                except Exception as exc:
+                    logger.debug("stream edit skipped: %s", exc)
+        await producer
+    finally:
+        typing_task.cancel()
+        if failure:
+            logger.warning("chat stream failed (%s), falling back", failure[0])
+
+    text = "".join(parts).strip()
+    if not text:
+        # Streaming yielded nothing - fall back to the proven router path so the
+        # user still gets an answer instead of silence.
+        try:
+            text, _provider = await asyncio.to_thread(
+                ROUTER.chat, messages, temperature, max_tokens
+            )
+            text = (text or "").strip()
+        except Exception as exc:
+            logger.error("chat fallback failed: %s", exc)
+            try:
+                await placeholder.edit_text(
+                    f"\u274c AI unavailable: {exc}"[:4000]
+                )
+            except Exception:
+                pass
+            return None
+
+    try:
+        await placeholder.delete()
+    except Exception:
+        pass
+    await send_long(update, text)
+    return text
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
@@ -349,7 +522,7 @@ async def tokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /save command."""
     global conversation_history
-    if auto_save(conversation_history):
+    if auto_save(conversation_history, current_model):
         await send_long(update, "💾 Session saved successfully.")
     else:
         await send_long(update, "❌ Failed to save session.")
@@ -377,12 +550,12 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = io.StringIO()
     with redirect_stdout(f):
         reconnaissance_prompt = f"Perform comprehensive target reconnaissance on {target}. Provide detailed information about the target's attack surface, technologies, infrastructure, and potential entry points."
-        response = get_reply(current_model, [{"role": "user", "content": reconnaissance_prompt}])
+        response = await aget_reply(current_model, [{"role": "user", "content": reconnaissance_prompt}])
 
     # Add to conversation history
     conversation_history.append({"role": "user", "content": f"/scan {target}"})
     conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history)
+    auto_save(conversation_history, current_model)
 
     await send_long(update, f"🎯 **Reconnaissance Results for {target}:**\n\n{response}", parse_mode='Markdown')
 
@@ -399,12 +572,12 @@ async def cve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = io.StringIO()
     with redirect_stdout(f):
         cve_prompt = f"Provide detailed analysis of {cve_id}: vulnerability description, affected systems, CVSS score, exploit availability, patch status, and mitigation strategies."
-        response = get_reply(current_model, [{"role": "user", "content": cve_prompt}])
+        response = await aget_reply(current_model, [{"role": "user", "content": cve_prompt}])
 
     # Add to conversation history
     conversation_history.append({"role": "user", "content": f"/cve {cve_id}"})
     conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history)
+    auto_save(conversation_history, current_model)
 
     await send_long(update, f"🐛 **CVE Analysis for {cve_id}:**\n\n{response}", parse_mode='Markdown')
 
@@ -421,12 +594,12 @@ async def exploit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = io.StringIO()
     with redirect_stdout(f):
         exploit_prompt = f"Detail exploitation techniques, payloads, and bypass methods for {vuln_type} vulnerabilities. Include required tools, skill level, and effectiveness ratings."
-        response = get_reply(current_model, [{"role": "user", "content": exploit_prompt}])
+        response = await aget_reply(current_model, [{"role": "user", "content": exploit_prompt}])
 
     # Add to conversation history
     conversation_history.append({"role": "user", "content": f"/exploit {vuln_type}"})
     conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history)
+    auto_save(conversation_history, current_model)
 
     await send_long(update, f"⚡ **Exploitation Techniques for {vuln_type}:**\n\n{response}", parse_mode='Markdown')
 
@@ -443,12 +616,12 @@ async def harden_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = io.StringIO()
     with redirect_stdout(f):
         harden_prompt = f"Provide comprehensive security hardening recommendations for {system}. Include configuration changes, patch management, network segmentation, monitoring, and incident response improvements."
-        response = get_reply(current_model, [{"role": "user", "content": harden_prompt}])
+        response = await aget_reply(current_model, [{"role": "user", "content": harden_prompt}])
 
     # Add to conversation history
     conversation_history.append({"role": "user", "content": f"/harden {system}"})
     conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history)
+    auto_save(conversation_history, current_model)
 
     await send_long(update, f"🛡️ **Hardening Recommendations for {system}:**\n\n{response}", parse_mode='Markdown')
 
@@ -465,12 +638,12 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = io.StringIO()
     with redirect_stdout(f):
         analyze_prompt = f"Conduct a complete 4-phase penetration test assessment on {target}:\\n1. Target Reconnaissance\\n2. Vulnerability Mapping (with severity)\\n3. Exploitation Plan\\n4. Remediation & Hardening Plan\\nProvide detailed, technical, and actionable findings for each phase."
-        response = get_reply(current_model, [{"role": "user", "content": analyze_prompt}])
+        response = await aget_reply(current_model, [{"role": "user", "content": analyze_prompt}])
 
     # Add to conversation history
     conversation_history.append({"role": "user", "content": f"/analyze {target}"})
     conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history)
+    auto_save(conversation_history, current_model)
 
     await send_long(update, f"📋 **Full 4-Phase Penetration Test Report for {target}:**\n\n{response}", parse_mode='Markdown')
 
@@ -487,12 +660,12 @@ async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = io.StringIO()
     with redirect_stdout(f):
         generate_prompt = f"Generate professional security content about {topic}. This could be a report, writeup, analysis, or documentation suitable for security professionals."
-        response = get_reply(current_model, [{"role": "user", "content": generate_prompt}])
+        response = await aget_reply(current_model, [{"role": "user", "content": generate_prompt}])
 
     # Add to conversation history
     conversation_history.append({"role": "user", "content": f"/generate {topic}"})
     conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history)
+    auto_save(conversation_history, current_model)
 
     await send_long(update, f"📄 **Generated Content on {topic}:**\n\n{response}", parse_mode='Markdown')
 
@@ -509,12 +682,12 @@ async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = io.StringIO()
     with redirect_stdout(f):
         scrape_prompt = f"Analyze the following text and extract key security-relevant information: indicators of compromise, vulnerabilities, attack patterns, or actionable intelligence:\\n\\n{text}"
-        response = get_reply(current_model, [{"role": "user", "content": scrape_prompt}])
+        response = await aget_reply(current_model, [{"role": "user", "content": scrape_prompt}])
 
     # Add to conversation history
     conversation_history.append({"role": "user", "content": f"/scrape {text[:50]}..." if len(text) > 50 else f"/scrape {text}"})
     conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history)
+    auto_save(conversation_history, current_model)
 
     await send_long(update, f"🔎 **Extracted Information:**\n\n{response}", parse_mode='Markdown')
 
@@ -629,7 +802,7 @@ Provide:
 
 Format as a professional security report with clear, actionable steps."""
 
-                        ai_response = get_reply(current_model, [{"role": "user", "content": ai_prompt}])
+                        ai_response = await aget_reply(current_model, [{"role": "user", "content": ai_prompt}])
 
                         all_data_classes = [item for b in detailed_breaches for item in b["DataClasses"]]
                         response = f"""🚨 **CONFIRMED BREACH DETECTION** - {target}
@@ -750,7 +923,7 @@ Get a free API key at https://haveibeenpwned.com/API/Key and set `HIBP_API_KEY` 
     # Add to conversation history
     conversation_history.append({"role": "user", "content": f"/leak {target}"})
     conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history)
+    auto_save(conversation_history, current_model)
 
     await send_long(update, response, parse_mode='Markdown')
 
@@ -787,8 +960,8 @@ async def crypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             okx = ccxt.okx({'enableRateLimit': True})
 
             # Fetch tickers from both exchanges
-            binance_ticker = binance.fetch_ticker(symbol)
-            okx_ticker = okx.fetch_ticker(symbol)
+            binance_ticker = await asyncio.to_thread(binance.fetch_ticker, symbol)
+            okx_ticker = await asyncio.to_thread(okx.fetch_ticker, symbol)
 
             # Format the response
             response = f"""💰 **CRYPTO MARKET INTELLIGENCE REPORT** - {symbol}
@@ -821,7 +994,7 @@ async def crypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Add to conversation history
     conversation_history.append({"role": "user", "content": f"/crypto {symbol}"})
     conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history)
+    auto_save(conversation_history, current_model)
 
     await send_long(update, response, parse_mode='Markdown')
 
@@ -851,12 +1024,12 @@ Include:
 
 Provide actionable insights for traders and investors. Use your elite security analysis mindset to identify potential market manipulation risks or unusual activity patterns."""
 
-        response = get_reply(current_model, [{"role": "user", "content": market_prompt}])
+        response = await aget_reply(current_model, [{"role": "user", "content": market_prompt}])
 
     # Add to conversation history
     conversation_history.append({"role": "user", "content": f"/market {keyword}"})
     conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history)
+    auto_save(conversation_history, current_model)
 
     await send_long(update, f"📊 **MARKET INTELLIGENCE ANALYSIS: {keyword}**\n\n{response}", parse_mode='Markdown')
 
@@ -888,12 +1061,12 @@ Provide:
 
 Structure this as a professional intelligence report suitable for security teams and CISOs. Use clear, actionable language with specific details where possible."""
 
-        response = get_reply(current_model, [{"role": "user", "content": intel_prompt}])
+        response = await aget_reply(current_model, [{"role": "user", "content": intel_prompt}])
 
     # Add to conversation history
     conversation_history.append({"role": "user", "content": f"/darkweb_intel {topic}"})
     conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history)
+    auto_save(conversation_history, current_model)
 
     await send_long(update, f"🕵️‍♂️ **DARK WEB THREAT INTELLIGENCE REPORT**\n\nTopic: {topic}\n\n{response}", parse_mode='Markdown')
 
@@ -953,38 +1126,26 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cleanup_temp_file(temp_ogg_path)
         cleanup_temp_file(temp_wav_path)
 
+async def _chat_respond(update: Update, prompt: str):
+    """Shared chat pipeline: stream the reply, then record it in history."""
+    response = await stream_ai_reply(update, prompt)
+    if not response:
+        return None
+    conversation_history.append({"role": "user", "content": prompt})
+    conversation_history.append({"role": "assistant", "content": response})
+    del conversation_history[:-40]  # keep the saved session bounded
+    auto_save(conversation_history, current_model)
+    return response
+
+
 async def handle_message_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     """Process text (from voice or regular message) and get RAVEN's response."""
-    await update.message.chat.send_action(action="typing")  # Show typing indicator
-    
-    # Capture stdout to prevent console spam
-    f = io.StringIO()
-    with redirect_stdout(f):
-        response = get_reply(current_model, [{"role": "user", "content": text}])
+    return await _chat_respond(update, text)
 
-    # Add to conversation history
-    conversation_history.append({"role": "user", "content": text})
-    conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history)
-
-    await send_long(update, response)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle regular text messages."""
-    user_message = update.message.text
-    await send_long(update, "🤖 RAVEN is analyzing...", parse_mode='Markdown')
-
-    # Capture stdout to prevent console spam
-    f = io.StringIO()
-    with redirect_stdout(f):
-        response = get_reply(current_model, [{"role": "user", "content": user_message}])
-
-    # Add to conversation history
-    conversation_history.append({"role": "user", "content": user_message})
-    conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history)
-
-    await send_long(update, response)
+    return await _chat_respond(update, update.message.text)
 
 # MODULE C: AUTOMATED DAILY INTELLIGENCE BRIEFINGS
 async def send_daily_briefing(bot):
@@ -1007,10 +1168,10 @@ async def send_daily_briefing(bot):
                 okx = ccxt.okx({'enableRateLimit': True})
                 
                 # Get BTC and ETH prices
-                btc_binance = binance.fetch_ticker('BTC/USDT')
-                btc_okx = okx.fetch_ticker('BTC/USDT')
-                eth_binance = binance.fetch_ticker('ETH/USDT')
-                eth_okx = okx.fetch_ticker('ETH/USDT')
+                btc_binance = await asyncio.to_thread(binance.fetch_ticker, 'BTC/USDT')
+                btc_okx = await asyncio.to_thread(okx.fetch_ticker, 'BTC/USDT')
+                eth_binance = await asyncio.to_thread(binance.fetch_ticker, 'ETH/USDT')
+                eth_okx = await asyncio.to_thread(okx.fetch_ticker, 'ETH/USDT')
                 
                 crypto_snapshot = f"""💰 **CRYPTO SNAPSHOT**
 • BTC: ${btc_binance['last']:,.2f} (Binance) | ${btc_okx['last']:,.2f} (OKX) 
@@ -1037,7 +1198,7 @@ async def send_daily_briefing(bot):
             
             Format as brief, actionable intelligence bullets."""
             
-            threat_intel = get_reply(current_model, [{"role": "user", "content": threat_prompt}])
+            threat_intel = await aget_reply(current_model, [{"role": "user", "content": threat_prompt}])
             threat_section = f"""🕵️‍♂️ **THREAT INTEL**
 {threat_intel}
                 """
@@ -1057,7 +1218,7 @@ async def send_daily_briefing(bot):
             
             Format as numbered list."""
             
-            defense_tips = get_reply(current_model, [{"role": "user", "content": defense_prompt}])
+            defense_tips = await aget_reply(current_model, [{"role": "user", "content": defense_prompt}])
             defense_section = f"""🛡️ **ACTIONABLE DEFENSE**
 {defense_tips}
                 """
@@ -1142,7 +1303,7 @@ def setup_scheduler(application):
 import analytics as raven_analytics
 import content_creator
 import social_media_manager
-from multi_provider_ai import ROUTER, RAVEN_SYSTEM_PROMPT
+from multi_provider_ai import ROUTER, RAVEN_SYSTEM_PROMPT, OLLAMA_TIMEOUT
 from trading_engine import TradingEngine
 
 # Shared engine instance (paper mode by default - see .env TRADING_MODE)
@@ -1353,7 +1514,7 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     symbol = TRADING.normalize_symbol(context.args[0])
     try:
-        price = TRADING.get_price(symbol)
+        price = await asyncio.to_thread(TRADING.get_price, symbol)
     except Exception as exc:
         await send_long(update, f"❌ Could not fetch price for {symbol}: {exc}")
         return
@@ -1370,7 +1531,7 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "RATIONALE: <one sentence>"
     )
     try:
-        text = ai_reply(prompt, max_tokens=300)
+        text = await asyncio.to_thread(ai_reply, prompt, max_tokens=300)
     except Exception as exc:
         logger.exception("signal generation failed")
         await send_long(update, f"❌ AI unavailable: {exc}")
@@ -1489,7 +1650,7 @@ async def thread_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "End with a call to action. No hashtags in the middle posts."
     )
     try:
-        text = ai_reply(prompt, max_tokens=700)
+        text = await asyncio.to_thread(ai_reply, prompt, max_tokens=700)
     except Exception as exc:
         logger.exception("thread generation failed")
         await send_long(update, f"❌ AI unavailable: {exc}")
@@ -1532,7 +1693,7 @@ async def create_content_command(update: Update, context: ContextTypes.DEFAULT_T
     topic = " ".join(context.args[1:])
     await send_long(update, f"🎬 Generating {platform} content package for: {topic}")
     try:
-        package = content_creator.content_package(platform, topic)
+        package = await asyncio.to_thread(content_creator.content_package, platform, topic)
     except Exception as exc:
         logger.exception("content generation failed")
         await send_long(update, f"❌ AI unavailable: {exc}")
@@ -1557,7 +1718,7 @@ async def content_calendar_command(update: Update, context: ContextTypes.DEFAULT
         return
     await send_long(update, f"📅 Building a {days}-day {platform} calendar...")
     try:
-        text = content_creator.content_calendar(platform, days)
+        text = await asyncio.to_thread(content_creator.content_calendar, platform, days)
     except Exception as exc:
         logger.exception("content calendar failed")
         await send_long(update, f"❌ AI unavailable: {exc}")
