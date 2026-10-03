@@ -7,9 +7,10 @@ import logging
 import io
 import sys
 import json
-import time
 import hashlib
+import time
 from contextlib import redirect_stdout
+from urllib.parse import quote
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from raven import get_reply, now_str, auto_save, auto_load
@@ -448,6 +449,36 @@ async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔎 **Extracted Information:**\n\n{response}", parse_mode='Markdown')
 
 # MODULE A: REAL BREACH DATA (/leak command with HIBP API)
+
+# Reusable response blocks
+_NO_BREACH_RESPONSE = """✅ **NO BREACHES DETECTED** - {target}
+
+🔒 **VERIFIED BY**: Have I Been Pwned (HIBP) API
+🛡️ **STATUS**: This email address does not appear in any known breach databases.
+
+**RECOMMENDATIONS:**
+1. Continue practicing good security hygiene
+2. Use unique, strong passwords for each service
+3. Enable multi-factor authentication where available
+4. Regularly monitor for breach notifications
+5. Consider using a password manager
+6. Periodically repeat this check (especially after major breach disclosures)
+
+**NOTE:** Data sourced from Have I Been Pwned API (https://haveibeenpwned.com/API/v3)
+*Analysis conducted by RAVEN Breach Intelligence Module*"""
+
+_RATE_LIMIT_RESPONSE = """⚠️ **RATE LIMIT EXCEEDED** - {target}
+
+🔒 **VERIFIED BY**: Have I Been Pwned (HIBP) API
+📉 **STATUS**: Too many requests. Please wait a moment before trying again.
+
+**RECOMMENDATIONS:**
+1. Wait a few minutes before checking again
+2. Consider upgrading your HIBP API plan for higher rate limits
+3. Use cached results if available for recent checks
+
+*Analysis conducted by RAVEN Breach Intelligence Module*"""
+
 async def leak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /leak command - check if email/domain appears in breach data using HIBP API."""
     if not context.args:
@@ -460,24 +491,130 @@ async def leak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Capture stdout to prevent console spam
     f = io.StringIO()
     with redirect_stdout(f):
-        # Check if we have the required dependencies
+        hibp_api_key = os.getenv("HIBP_API_KEY", "").strip()
+
+        # ---- Dependency check ----
         if not REQUESTS_AVAILABLE:
-            response = f"❌ Real breach detection not available.\\nPlease install requests: `pip install requests`"
-        elif not os.getenv("HIBP_API_KEY"):
-            response = f"⚠️ HIBP API key not configured. Using simulated breach check.\\nGet a free API key at https://haveibeenpwned.com/API/Key"
-            # Fall back to simulated response
+            response = "❌ Real breach detection not available.\nPlease install requests: `pip install requests`"
+
+        # ---- Domain (non-email) target: HIBP v3 only supports emails ----
+        elif "@" not in target:
+            response = f"""⚠️ **DOMAIN BREACH CHECK LIMITATION** - {target}
+
+The Have I Been Pwned API v3 only supports checking individual email addresses, not domains directly.
+
+For domain breach monitoring, you would need to:
+1. Check known email addresses associated with the domain
+2. Use alternative breach intelligence services
+3. Monitor public paste sites for domain mentions
+
+**RECOMMENDATION:** Try checking specific email addresses from this domain using /leak email@domain.com
+
+*Analysis conducted by RAVEN OSINT Module*"""
+
+        # ---- Real HIBP API (key configured, email target) ----
+        elif hibp_api_key and hibp_api_key != "your_haveibeenpwned_api_key_here":
+            headers = {
+                "hibp-api-key": hibp_api_key,
+                "user-agent": "RAVEN-Security-Bot"
+            }
+            try:
+                url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{quote(target)}"
+                response_obj = requests.get(
+                    url,
+                    headers=headers,
+                    params={"truncateResponse": "false"},
+                    timeout=15
+                )
+
+                if response_obj.status_code == 200:
+                    breaches = response_obj.json()
+                    if isinstance(breaches, list) and len(breaches) > 0:
+                        breach_names = [breach.get("Name", "Unknown") for breach in breaches]
+                        breach_count = len(breach_names)
+
+                        # Get detailed breach info for the response (first 3)
+                        detailed_breaches = []
+                        for breach in breaches[:3]:
+                            detailed_breaches.append({
+                                "Name": breach.get("Name", "Unknown"),
+                                "Title": breach.get("Title", "Unknown"),
+                                "BreachDate": breach.get("BreachDate", "Unknown"),
+                                "PwnCount": breach.get("PwnCount", 0),
+                                "DataClasses": breach.get("DataClasses", [])
+                            })
+
+                        # Generate damage assessment using RAVEN AI
+                        breach_list_str = ", ".join(breach_names[:5])
+                        if len(breach_names) > 5:
+                            breach_list_str += f" and {len(breach_names) - 5} more"
+
+                        ai_prompt = f"""Generate a comprehensive damage assessment and mitigation plan for the email address {target} which has been found in the following data breaches: {breach_list_str}.
+
+Provide:
+1. Immediate actions to take
+2. Investigation steps
+3. Long-term protection strategies
+4. Security hardening recommendations
+
+Format as a professional security report with clear, actionable steps."""
+
+                        ai_response = get_reply(current_model, [{"role": "user", "content": ai_prompt}])
+
+                        all_data_classes = [item for b in detailed_breaches for item in b["DataClasses"]]
+                        response = f"""🚨 **CONFIRMED BREACH DETECTION** - {target}
+
+🔒 **VERIFIED BY**: Have I Been Pwned (HIBP) API
+⚠️ **BREACH COUNT**: {breach_count} confirmed breach(es)
+
+**BREACH DETAILS:**
+{chr(10).join([f"• {b['Name']} ({b['Title']}) - {b['BreachDate']} - {b['PwnCount']:,} accounts" for b in detailed_breaches])}
+
+**DATA TYPES COMPROMISED:**
+{', '.join(all_data_classes[:10])}{'...' if len(all_data_classes) > 10 else ""}
+
+**DAMAGE ASSESSMENT & MITIGATION PLAN:**
+
+{ai_response}
+
+**NOTE:** Data sourced from Have I Been Pwned API (https://haveibeenpwned.com/API/v3)
+*Analysis conducted by RAVEN Breach Intelligence Module*"""
+                    else:
+                        response = _NO_BREACH_RESPONSE.format(target=target)
+                elif response_obj.status_code == 404:
+                    response = _NO_BREACH_RESPONSE.format(target=target)
+                elif response_obj.status_code == 401:
+                    response = f"""❌ **INVALID HIBP API KEY**
+
+The Have I Been Pwned API rejected the configured key (HTTP 401).
+
+**FIX:** Check your `HIBP_API_KEY` in the `.env` file and get a valid key at https://haveibeenpwned.com/API/Key
+
+*Analysis conducted by RAVEN Breach Intelligence Module*"""
+                elif response_obj.status_code == 429:
+                    response = _RATE_LIMIT_RESPONSE.format(target=target)
+                else:
+                    response = f"❌ Error from HIBP API: HTTP {response_obj.status_code}\n{response_obj.text}"
+            except Exception as e:
+                response = f"❌ Error conducting breach check: {str(e)}\n\nPlease check:\n1. HIBP API key validity\n2. Internet connection\n3. Target format (email address)"
+
+        # ---- Simulated fallback (no API key configured) ----
+        else:
+            response = f"""⚠️ HIBP API key not configured. Using simulated breach check.
+Get a free API key at https://haveibeenpwned.com/API/Key and set `HIBP_API_KEY` in `.env` for real data.
+
+"""
             target_hash = hashlib.md5(target.lower().encode()).hexdigest()
-            is_breached = int(target_hash[:8], 16) % 7 == 0  # ~14% chance of being "found"
-            
+            is_breached = int(target_hash[:8], 16) % 7 == 0  # deterministic pseudo-check
+
             if is_breached:
-                # Simulate breach data
                 breach_count = (int(target_hash[8:12], 16) % 5) + 1  # 1-5 breaches
                 latest_breach_year = 2020 + (int(target_hash[12:16], 16) % 4)  # 2020-2023
                 data_types = ["Email addresses", "Passwords", "Personal data", "Credit card data"]
                 compromised_data = [data_types[int(target_hash[i:i+2], 16) % len(data_types)]
-                                 for i in range(16, min(26, len(target_hash)), 2)][:3]
-                
-                response = f"""🚨 **BREACH ALERT** - {target}
+                                    for i in range(16, min(26, len(target_hash)), 2)][:3]
+
+                response += f"""🚨 **BREACH ALERT** - {target}
 
 ⚠️ **THREAT DETECTED**: This target has appeared in {breach_count} known data breach(es)
 
@@ -520,7 +657,7 @@ async def leak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 *Analysis conducted by RAVEN Dark Web OSINT Module*"""
             else:
-                response = f"""✅ **NO BREACHES DETECTED** - {target}
+                response += f"""✅ **NO BREACHES DETECTED** - {target}
 
 🛡️ **STATUS**: This target does not appear in known breach databases (based on simulated check).
 
@@ -539,147 +676,6 @@ async def leak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 - Or similar breach intelligence platforms
 
 *Analysis conducted by RAVEN Dark Web OSINT Module*"""
-        else:
-            # Use real HIBP API
-            hibp_api_key = os.getenv("HIBP_API_KEY")
-            headers = {
-                "hibp-api-key": hibp_api_key,
-                "user-agent": "RAVEN-Security-Bot"
-            }
-            
-            try:
-                # For email addresses
-                if "@" in target:
-                    url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{target}"
-                    params = {"truncateResponse": "false"}
-                # For domains, we need to search differently (HIBP doesn't have direct domain search)
-                # We'll use the pastebin search or note this limitation
-                else:
-                    # Note: HIBP API v3 doesn't have a direct domain endpoint
-                    # We would need to use alternative methods or admit limitation
-                    response = f"""⚠️ **DOMAIN BREACH CHECK LIMITATION** - {target}
-
-The Have I Been Pwned API v3 only supports checking individual email addresses, not domains directly.
-
-For domain breach monitoring, you would need to:
-1. Check known email addresses associated with the domain
-2. Use alternative breach intelligence services
-3. Monitor public paste sites for domain mentions
-
-**RECOMMENDATION:** Try checking specific email addresses from this domain using /leak email@domain.com
-
-*Analysis conducted by RAVEN OSINT Module*"""
-                    # Add to conversation history even for limitation notice
-                    conversation_history.append({"role": "user", "content": f"/leak {target}"})
-                    conversation_history.append({"role": "assistant", "content": response})
-                    auto_save(conversation_history)
-                    await update.message.reply_text(response, parse_mode='Markdown')
-                    return
-                
-                if "@" in target:  # Only make API call for emails
-                    response_obj = requests.get(url, headers=headers, params=params)
-                    
-                    if response_obj.status_code == 200:
-                        breaches = response_obj.json()
-                        if isinstance(breaches, list) and len(breaches) > 0:
-                            breach_names = [breach.get("Name", "Unknown") for breach in breaches]
-                            breach_count = len(breach_names)
-                            
-                            # Get detailed breach info for the response
-                            detailed_breaches = []
-                            for breach in breaches[:3]:  # Limit to first 3 for readability
-                                detailed_breaches.append({
-                                    "Name": breach.get("Name", "Unknown"),
-                                    "Title": breach.get("Title", "Unknown"),
-                                    "Domain": breach.get("Domain", "Unknown"),
-                                    "BreachDate": breach.get("BreachDate", "Unknown"),
-                                    "PwnCount": breach.get("PwnCount", 0),
-                                    "DataClasses": breach.get("DataClasses", [])
-                                })
-                            
-                            # Generate damage assessment using RAVEN AI
-                            breach_list_str = ", ".join(breach_names[:5])  # First 5 for prompt
-                            if len(breach_names) > 5:
-                                breach_list_str += f" and {len(breach_names) - 5} more"
-                            
-                            # Get AI-generated damage assessment
-                            ai_prompt = f"""Generate a comprehensive damage assessment and mitigation plan for the email address {target} which has been found in the following data breaches: {breach_list_str}.
-                            
-                            Provide:
-                            1. Immediate actions to take
-                            2. Investigation steps
-                            3. Long-term protection strategies
-                            4. Security hardening recommendations
-                            
-                            Format as a professional security report with clear, actionable steps."""
-                            
-                            ai_response = get_reply(current_model, [{"role": "user", "content": ai_prompt}])
-                            
-                            response = f"""🚨 **CONFIRMED BREACH DETECTION** - {target}
-
-🔒 **VERIFIED BY**: Have I Been Pwned (HIBP) API
-⚠️ **BREACH COUNT**: {breach_count} confirmed breach(es)
-
-**BREACH DETAILS:**
-{chr(10).join([f"• {b['Name']} ({b['Title']}) - {b['BreachDate']} - {b['PwnCount']:,} accounts" for b in detailed_breaches])}
-
-**DATA TYPES COMPROMISED:**
-{', '.join([item for sublist in [b['DataClasses'] for b in detailed_breaches] for item in sublist][:10])}{'...' if len([item for sublist in [b['DataClasses'] for b in detailed_breaches] for item in sublist]) > 10 else ""}
-
-**DAMAGE ASSESSMENT & MITIGATION PLAN:**
-
-{ai_response}
-
-**NOTE:** Data sourced from Have I Been Pwned API (https://haveibeenpwned.com/API/v3)
-*Analysis conducted by RAVEN Breach Intelligence Module*"""
-                        else:
-                            response = f"""✅ **NO BREACHES DETECTED** - {target}
-
-🔒 **VERIFIED BY**: Have I Been Pwned (HIBP) API
-🛡️ **STATUS**: This email address does not appear in any known breach databases.
-
-**RECOMMENDATIONS:**
-1. Continue practicing good security hygiene
-2. Use unique, strong passwords for each service
-3. Enable multi-factor authentication where available
-4. Regularly monitor for breach notifications
-5. Consider using a password manager
-6. Periodically repeat this check (especially after major breach disclosures)
-
-**NOTE:** Data sourced from Have I Been Pwned API (https://haveibeenpwned.com/API/v3)
-*Analysis conducted by RAVEN Breach Intelligence Module*"""
-                    elif response_obj.status_code == 404:
-                        response = f"""✅ **NO BREACHES DETECTED** - {target}
-
-🔒 **VERIFIED BY**: Have I Been Pwned (HIBP) API
-🛡️ **STATUS**: This email address does not appear in any known breach databases.
-
-**RECOMMENDATIONS:**
-1. Continue practicing good security hygiene
-2. Use unique, strong passwords for each service
-3. Enable multi-factor authentication where available
-4. Regularly monitor for breach notifications
-5. Consider using a password manager
-6. Periodically repeat this check (especially after major breach disclosures)
-
-**NOTE:** Data sourced from Have I Been Pwned API (https://haveibeenpwned.com/API/v3)
-*Analysis conducted by RAVEN Breach Intelligence Module*"""
-                    elif response_obj.status_code == 429:
-                        response = f"""⚠️ **RATE LIMIT EXCEEDED** - {target}
-
-🔒 **VERIFIED BY**: Have I Been Pwned (HIBP) API
-📉 **STATUS**: Too many requests. Please wait a moment before trying again.
-
-**RECOMMENDATIONS:**
-1. Wait a few minutes before checking again
-2. Consider upgrading your HIBP API plan for higher rate limits
-3. Use cached results if available for recent checks
-
-*Analysis conducted by RAVEN Breach Intelligence Module*"""
-                    else:
-                        response = f"❌ Error from HIBP API: HTTP {response_obj.status_code}\\n{response_obj.text}"
-            except Exception as e:
-                response = f"❌ Error conducting breach check: {str(e)}\\n\\nPlease check:\\n1. HIBP API key validity\\n2. Internet connection\\n3. Target format (email address)"
 
     # Add to conversation history
     conversation_history.append({"role": "user", "content": f"/leak {target}"})
@@ -687,6 +683,149 @@ For domain breach monitoring, you would need to:
     auto_save(conversation_history)
 
     await update.message.reply_text(response, parse_mode='Markdown')
+
+# ==========================================
+# INTELLIGENCE MODULES (crypto / market / darkweb_intel)
+# ==========================================
+async def crypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /crypto command - get real-time crypto prices from Binance and OKX."""
+    if not CCXT_AVAILABLE:
+        await update.message.reply_text(
+            "❌ Crypto intelligence module not available.\n"
+            "Please install ccxt: `pip install ccxt`",
+            parse_mode='Markdown'
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Usage: /crypto <symbol>\nExample: /crypto BTC or /crypto ETH/USDT")
+        return
+
+    symbol = " ".join(context.args).upper()
+    # Ensure symbol has a market pair format
+    if '/' not in symbol and len(symbol) <= 5:  # Assume it's a base currency like BTC
+        symbol = f"{symbol}/USDT"
+
+    await update.message.reply_text(f"📊 Fetching real-time data for `{symbol}` from Binance & OKX...", parse_mode='Markdown')
+
+    # Capture stdout to prevent console spam
+    f = io.StringIO()
+    with redirect_stdout(f):
+        try:
+            # Initialize exchanges
+            binance = ccxt.binance({'enableRateLimit': True})
+            okx = ccxt.okx({'enableRateLimit': True})
+
+            # Fetch tickers from both exchanges
+            binance_ticker = binance.fetch_ticker(symbol)
+            okx_ticker = okx.fetch_ticker(symbol)
+
+            # Format the response
+            response = f"""💰 **CRYPTO MARKET INTELLIGENCE REPORT** - {symbol}
+
+**BINANCE:**
+• Price: ${binance_ticker['last']:,.4f}
+• 24h Volume: {binance_ticker['baseVolume']:,.2f} {symbol.split('/')[0]}
+• 24h Change: {binance_ticker['percentage']:+.2f}%
+• Bid: ${binance_ticker['bid']:,.4f}
+• Ask: ${binance_ticker['ask']:,.4f}
+• High/Low: ${binance_ticker['high']:,.4f} / ${binance_ticker['low']:,.4f}
+
+**OKX:**
+• Price: ${okx_ticker['last']:,.4f}
+• 24h Volume: {okx_ticker['baseVolume']:,.2f} {symbol.split('/')[0]}
+• 24h Change: {okx_ticker['percentage']:+.2f}%
+• Bid: ${okx_ticker['bid']:,.4f}
+• Ask: ${okx_ticker['ask']:,.4f}
+• High/Low: ${okx_ticker['high']:,.4f} / ${okx_ticker['low']:,.4f}
+
+**ARBITRAGE OPPORTUNITY:**
+• Price Difference: ${abs(binance_ticker['last'] - okx_ticker['last']):,.4f} ({abs(binance_ticker['last'] - okx_ticker['last']) / ((binance_ticker['last'] + okx_ticker['last']) / 2) * 100:.2f}%)
+
+**TIMESTAMP:** {now_str()}
+*Data sourced from public APIs of Binance and OKX exchanges*"""
+
+        except Exception as e:
+            response = f"❌ Error fetching crypto data: {str(e)}\n\nPlease check:\n1. Symbol format (use format like BTC/USDT)\n2. Exchange availability\n3. Internet connection"
+
+    # Add to conversation history
+    conversation_history.append({"role": "user", "content": f"/crypto {symbol}"})
+    conversation_history.append({"role": "assistant", "content": response})
+    auto_save(conversation_history)
+
+    await update.message.reply_text(response, parse_mode='Markdown')
+
+async def market_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /market command - AI analysis of crypto market sentiment."""
+    if not context.args:
+        await update.message.reply_text("❌ Usage: /market <keyword>\nExample: /market Bitcoin or /market DeFi")
+        return
+
+    keyword = " ".join(context.args)
+    await update.message.reply_text(f"📈 Analyzing market sentiment for `{keyword}`...", parse_mode='Markdown')
+
+    # Capture stdout to prevent console spam
+    f = io.StringIO()
+    with redirect_stdout(f):
+        market_prompt = f"""As RAVEN, provide a comprehensive crypto market intelligence analysis for the keyword/topic: "{keyword}".
+
+Include:
+1. Current market sentiment and trends
+2. Key price levels and technical analysis insights
+3. Major news and developments affecting this asset/sector
+4. Risk factors and potential catalysts
+5. Trading volume and liquidity assessment
+6. Social media and community sentiment indicators
+7. On-chain metrics if applicable
+8. Short-term outlook (24-72 hours) and medium-term outlook (1-4 weeks)
+
+Provide actionable insights for traders and investors. Use your elite security analysis mindset to identify potential market manipulation risks or unusual activity patterns."""
+
+        response = get_reply(current_model, [{"role": "user", "content": market_prompt}])
+
+    # Add to conversation history
+    conversation_history.append({"role": "user", "content": f"/market {keyword}"})
+    conversation_history.append({"role": "assistant", "content": response})
+    auto_save(conversation_history)
+
+    await update.message.reply_text(f"📊 **MARKET INTELLIGENCE ANALYSIS: {keyword}**\n\n{response}", parse_mode='Markdown')
+
+async def darkweb_intel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /darkweb_intel command - generate dark web threat intelligence report."""
+    if not context.args:
+        await update.message.reply_text("❌ Usage: /darkweb_intel <topic>\nExample: /darkweb_intel ransomware gangs targeting healthcare")
+        return
+
+    topic = " ".join(context.args)
+    await update.message.reply_text(f"🕵️‍♂️ Generating dark web intelligence report on `{topic}`...", parse_mode='Markdown')
+
+    # Capture stdout to prevent console spam
+    f = io.StringIO()
+    with redirect_stdout(f):
+        intel_prompt = f"""As RAVEN with expertise in Dark Web OSINT & Threat Intelligence, generate a comprehensive intelligence report on: "{topic}".
+
+Provide:
+1. **THREAT OVERVIEW**: Current landscape and key threat actors
+2. **RECENT ACTIVITY**: Notable incidents, campaigns, or trends in the last 3-6 months
+3. **TTPs (Tactics, Techniques, Procedures)**: How these threats operate
+4. **INFRASTRUCTURE**: Known dark web marketplaces, forums, or communication channels used
+5. **VICTIMOLOGY**: Typical targets and victim profiles
+6. **FINANCIAL ASPECTS**: Estimated revenue, payment methods, and economic impact
+7. **LAW ENFORCEMENT RESPONSE**: Recent operations, takedowns, or legal actions
+8. **DEFENSIVE RECOMMENDATIONS**: Specific mitigation strategies for organizations
+9. **OUTLOOK**: Emerging trends and future threats to watch
+10. **CONFIDENCE LEVEL**: Assessment of information reliability and source quality
+
+Structure this as a professional intelligence report suitable for security teams and CISOs. Use clear, actionable language with specific details where possible."""
+
+        response = get_reply(current_model, [{"role": "user", "content": intel_prompt}])
+
+    # Add to conversation history
+    conversation_history.append({"role": "user", "content": f"/darkweb_intel {topic}"})
+    conversation_history.append({"role": "assistant", "content": response})
+    auto_save(conversation_history)
+
+    await update.message.reply_text(f"🕵️‍♂️ **DARK WEB THREAT INTELLIGENCE REPORT**\n\nTopic: {topic}\n\n{response}", parse_mode='Markdown')
 
 # MODULE B: VOICE COMMAND SUPPORT
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -778,7 +917,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(response)
 
 # MODULE C: AUTOMATED DAILY INTELLIGENCE BRIEFINGS
-async def send_daily_briefing(context: ContextTypes.DEFAULT_TYPE):
+async def send_daily_briefing(bot):
     """Send daily security intelligence briefing to admin chat."""
     try:
         # Get admin chat ID from environment
@@ -868,7 +1007,7 @@ async def send_daily_briefing(context: ContextTypes.DEFAULT_TYPE):
 *Next briefing: {os.getenv("DAILY_BRIEFING_TIME", "08:00")} daily*"""
             
             # Send to admin chat
-            await context.bot.send_message(
+            await bot.send_message(
                 chat_id=admin_chat_id,
                 text=briefing,
                 parse_mode='Markdown'
@@ -881,8 +1020,13 @@ async def send_daily_briefing(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error sending daily briefing: {e}")
 
-def setup_scheduler():
-    """Set up the daily briefing scheduler."""
+def setup_scheduler(application):
+    """Set up the daily briefing scheduler.
+
+    NOTE: This must be called from inside a running asyncio event loop
+    (i.e. via the application's post_init callback), otherwise
+    AsyncIOScheduler has no loop to attach to.
+    """
     global scheduler
     if not APSCHEDULER_AVAILABLE:
         logger.warning("APScheduler not available, daily briefings disabled")
@@ -899,9 +1043,12 @@ def setup_scheduler():
             hour, minute = 8, 0  # Default to 08:00
             logger.warning(f"Invalid time format '{time_str}', using 08:00")
         
-        # Add daily job
+        # Add daily job - wrapper to provide bot instance
+        async def daily_briefing_wrapper():
+            await send_daily_briefing(application.bot)
+        
         scheduler.add_job(
-            send_daily_briefing,
+            daily_briefing_wrapper,
             'cron',
             hour=hour,
             minute=minute,
@@ -916,6 +1063,20 @@ def setup_scheduler():
         logger.error(f"Failed to setup scheduler: {e}")
         return None
 
+async def post_init(application):
+    """Runs inside the event loop once the bot is initialized - safe place to start the scheduler."""
+    setup_scheduler(application)
+
+async def post_shutdown(application):
+    """Stop the scheduler cleanly when the bot shuts down."""
+    global scheduler
+    if scheduler and scheduler.running:
+        try:
+            scheduler.shutdown()
+            logger.info("Daily briefing scheduler shut down")
+        except Exception as e:
+            logger.warning(f"Scheduler shutdown issue: {e}")
+
 def main():
     """Start the bot."""
     # Get token from environment variable
@@ -924,8 +1085,15 @@ def main():
         logger.error("TELEGRAM_TOKEN environment variable not set!")
         return
 
-    # Create the Application
-    application = Application.builder().token(token).build()
+    # Create the Application (with post_init/post_shutdown to manage the scheduler
+    # inside the running event loop)
+    application = (
+        Application.builder()
+        .token(token)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     # Add handlers
     application.add_handler(CommandHandler("start", start_command))
@@ -962,8 +1130,8 @@ def main():
     # Message handler for natural conversation
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Setup scheduler for daily briefings
-    setup_scheduler()
+    # NOTE: The daily-briefing scheduler is now started in post_init()
+    # (inside the running event loop), so it is not started here anymore.
 
     # Start the bot
     logger.info("Starting RAVEN Security Bot with Phase 3 features...")
