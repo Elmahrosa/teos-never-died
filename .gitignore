@@ -36,3 +36,14 @@ temp_voice_*.wav
 blobs/
 manifests/
 metadata/
+
+# SaaS data. Holds every customer record, so it must never enter git history.
+raven_saas.db
+raven_saas.db-journal
+raven_saas.db-wal
+raven_saas.db-shm
+raven_test_*.db
+
+# Media scratch space for photo/video/document analysis. Files are deleted in a
+# finally block, but a crash mid-analysis can leave user uploads behind.
+raven_media_tmp/

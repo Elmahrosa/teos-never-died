@@ -31,6 +31,12 @@ OLLAMA_HOST_DEFAULT = "http://127.0.0.1:11434"
 OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "300"))
 CLOUD_TIMEOUT = float(os.getenv("CLOUD_AI_TIMEOUT", "45"))
 
+# Ollama unloads a model 5 minutes after its last request unless told otherwise.
+# On this CPU-only host that reload costs a measured 130-143s before the first
+# token. Keeping the model resident for 30m removes that delay from every routed
+# command as well as normal chat. Blank RAVEN_KEEP_ALIVE to use Ollama's default.
+KEEP_ALIVE = os.getenv("RAVEN_KEEP_ALIVE", "30m").strip()
+
 # ----------------------------------------------------------------------
 # System prompt (used for every bot conversation)
 # ----------------------------------------------------------------------
@@ -174,6 +180,8 @@ class AIRouter:
                 "num_predict": max_tokens,
             },
         }
+        if KEEP_ALIVE:
+            payload["keep_alive"] = KEEP_ALIVE
         response = requests.post(
             f"{self.ollama_host}/api/chat", json=payload, timeout=OLLAMA_TIMEOUT
         )

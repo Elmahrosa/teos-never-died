@@ -12,6 +12,15 @@ KNOWLEDGE_DIR = ".raven_knowledge"
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 
+# How long Ollama should keep the model resident in RAM after the last request.
+# Ollama's own default is 5m, which on this CPU-only host means the next message
+# pays a measured 130-143s cold load before a single token is produced. 30m keeps
+# it warm across a normal session. Set RAVEN_KEEP_ALIVE="" to restore the
+# Ollama default, or e.g. "10m" to trade RAM for a shorter residency window.
+KEEP_ALIVE = os.getenv("RAVEN_KEEP_ALIVE", "30m").strip()
+
+_KA_OPTS = {"keep_alive": KEEP_ALIVE} if KEEP_ALIVE else {}
+
 
 def ensure_session_dir():
     os.makedirs(SESSION_DIR, exist_ok=True)
@@ -193,12 +202,16 @@ def get_reply(model, messages, stream=False):
 
     `stream` defaults to False so callers that only pass (model, messages)
     work unchanged. The Telegram bot relies on this default.
+
+    Both paths pass keep_alive=KEEP_ALIVE so the model stays resident between
+    messages instead of being reloaded from disk every few minutes.
     """
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             if stream:
-                response = ollama.chat(model=model, messages=messages, stream=True)
+                response = ollama.chat(model=model, messages=messages,
+                                       stream=True, **_KA_OPTS)
                 print("\nRAVEN: ", end="", flush=True)
                 reply = ""
                 for chunk in response:
@@ -208,7 +221,8 @@ def get_reply(model, messages, stream=False):
                 print()
                 return reply
             else:
-                response = ollama.chat(model=model, messages=messages, stream=False)
+                response = ollama.chat(model=model, messages=messages,
+                                       stream=False, **_KA_OPTS)
                 reply = response["message"]["content"]
                 print(f"\nRAVEN: {reply}")
                 return reply

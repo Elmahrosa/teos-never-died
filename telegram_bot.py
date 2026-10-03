@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import logging
 import io
+import shutil
 import sys
 import json
 import hashlib
@@ -15,6 +16,22 @@ from urllib.parse import quote
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from raven import get_reply, now_str, auto_save, auto_load
+
+# SaaS + multimodal support. These modules degrade to inert behaviour when their
+# optional dependencies are absent, so the bot must still start if they are
+# broken or missing - which is why the import is guarded rather than fatal.
+try:
+    import database
+    import saas_manager as saas
+    import multimodal_engine as mm
+    SAAS_AVAILABLE = True
+except Exception as _saas_import_error:  # pragma: no cover
+    database = None
+    saas = None
+    mm = None
+    SAAS_AVAILABLE = False
+    logging.getLogger("raven.bot").error(
+        "SaaS/multimodal modules unavailable: %s", _saas_import_error)
 
 # Try to import ccxt for crypto functionality
 try:
@@ -72,6 +89,15 @@ logging.basicConfig(
     handlers=_handlers
 )
 logger = logging.getLogger(__name__)
+
+# httpx logs every request at INFO, and python-telegram-bot puts the bot token
+# in the URL path:
+#   INFO httpx: POST https://api.telegram.org/bot<TOKEN>/getUpdates "200 OK"
+# That wrote the live bot token to bot.log on a loop every 10 seconds, so the
+# log file was a plaintext credential store. Raise the threshold - these lines
+# carry no diagnostic value here, and errors still surface at WARNING.
+for _noisy in ("httpx", "httpcore", "telegram", "apscheduler.executors"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # Global variables for bot state
 conversation_history = []
@@ -1147,6 +1173,309 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle regular text messages."""
     return await _chat_respond(update, update.message.text)
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Multimodal handlers (photo / video / document)
+#
+# Every one of these does its heavy work through asyncio.to_thread, because
+# vision inference, ffmpeg and PDF parsing are all synchronous and would
+# otherwise stall the event loop - the same class of bug that used to freeze
+# normal chat.
+# ═══════════════════════════════════════════════════════════════════════════
+MEDIA_TMP_DIR = os.getenv("RAVEN_MEDIA_TMP", "raven_media_tmp")
+
+
+def _media_tmp(name: str) -> str:
+    os.makedirs(MEDIA_TMP_DIR, exist_ok=True)
+    return os.path.join(MEDIA_TMP_DIR, name)
+
+
+def _short_id(file_id: str) -> str:
+    """Stable short token for a Telegram file_id, safe as a filename."""
+    return hashlib.sha256((file_id or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _human_size(nbytes: int) -> str:
+    """Readable size. Avoids printing a misleading '0 KB' for small files."""
+    nbytes = int(nbytes or 0)
+    if nbytes < 1024:
+        return f"{nbytes} B"
+    for unit in ("KB", "MB", "GB"):
+        nbytes /= 1024.0
+        if nbytes < 1024 or unit == "GB":
+            return f"{nbytes:.1f} {unit}"
+    return f"{nbytes:.1f} GB"
+
+
+async def _media_gate(update: Update, action: str) -> bool:
+    """Check tier capability + daily quota for a media action.
+
+    Returns True when processing may proceed; otherwise sends the refusal and
+    returns False. Admins always pass. Mirrors saas_manager.requires() but is
+    written out because MessageHandlers take the same (update, context) shape
+    while needing the gate before they touch the file.
+    """
+    user = getattr(update, "effective_user", None)
+    if user is None:
+        return False
+    if is_admin(user.id):
+        return True
+    allowed, reason = await saas.evaluate(user.id, action, is_admin=False)
+    if not allowed:
+        await send_long(update, reason)
+        return False
+    await saas.record_usage(user.id, action)
+    return True
+
+
+class _typing_forever:
+    """Async context manager keeping Telegram's typing indicator alive.
+
+    Telegram clears the indicator after ~5s, and multimodal analysis routinely
+    takes minutes, so without this the bot looks hung.
+    """
+
+    def __init__(self, update: Update):
+        self._update = update
+        self._task = None
+
+    async def __aenter__(self):
+        async def _pump():
+            while True:
+                try:
+                    await self._update.message.chat.send_action("typing")
+                except Exception:
+                    return
+                await asyncio.sleep(4)
+
+        self._task = asyncio.create_task(_pump())
+        return self
+
+    async def __aexit__(self, *exc_info):
+        if self._task:
+            self._task.cancel()
+        return False
+
+
+async def _download_to(update: Update, context, file_id: str, dest: str) -> str:
+    """Fetch a Telegram file to `dest`. Returns the path, or raises."""
+    handle = await context.bot.get_file(file_id)
+    await handle.download_to_drive(custom_path=dest)
+    if not os.path.isfile(dest) or os.path.getsize(dest) == 0:
+        raise RuntimeError("Telegram returned an empty file")
+    return dest
+
+
+async def _finish_media(update: Update, note, text: str):
+    """Deliver a media analysis result, keeping `note` as a fallback."""
+    body = (text or "").strip()
+    if not body:
+        body = "Analysis completed but the model returned nothing."
+    # Leave the placeholder readable in case the long send fails partway.
+    try:
+        await note.edit_text("\u2705 Analysis complete - sending result...")
+    except Exception:
+        pass
+    await send_long(update, body)
+    try:
+        await note.delete()
+    except Exception:
+        pass
+
+
+def _caption_focus(caption: str) -> str:
+    """Turn a Telegram caption into an extra instruction for the model."""
+    caption = (caption or "").strip()
+    if not caption:
+        return ""
+    return f"\n\nThe sender added this instruction, honour it: {caption}"
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Analyze an image for security-relevant content."""
+    if not await _media_gate(update, saas.A_IMAGE):
+        return
+
+    photos = list(getattr(update.message, "photo", None) or [])
+    if not photos:
+        await send_long(update, "No image was attached to that message.")
+        return
+
+    # Telegram sends every size; the last element is the highest resolution.
+    largest = photos[-1]
+    note = await update.message.reply_text(
+        "\U0001F5BC Downloading image at highest resolution...", parse_mode=None)
+
+    path = _media_tmp(f"img_{_short_id(largest.file_id)}.jpg")
+    try:
+        async with _typing_forever(update):
+            await _download_to(update, context, largest.file_id, path)
+            size = os.path.getsize(path)
+            focus = _caption_focus(update.message.caption)
+            prompt = mm.VISION_PROMPT + focus
+            try:
+                result = await asyncio.to_thread(mm.analyze_image, path, prompt)
+            except Exception as exc:
+                logger.warning("image analysis failed: %s", exc)
+                result = f"\u274C Image analysis could not run.\n\n{exc}"
+            else:
+                result = (
+                    f"\U0001F5BC IMAGE ANALYSIS - {_human_size(size)}, "
+                    f"{largest.width}x{largest.height}\n" + result)
+
+        await _finish_media(update, note, result)
+    except Exception as exc:
+        logger.exception("handle_photo failed")
+        try:
+            await note.edit_text(f"\u274C Failed to process image: {exc}"[:4000])
+        except Exception:
+            pass
+    finally:
+        cleanup_temp_file(path)
+
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Extract keyframes from a video and review them."""
+    if not await _media_gate(update, saas.A_VIDEO):
+        return
+
+    video = getattr(update.message, "video", None)
+    if video is None:
+        await send_long(update, "No video was attached to that message.")
+        return
+
+    note = await update.message.reply_text(
+        "\U0001F3AC Downloading video and extracting keyframes...", parse_mode=None)
+
+    token = _short_id(video.file_id)
+    path = _media_tmp(f"vid_{token}.mp4")
+    frame_dir = _media_tmp(f"frames_{token}")
+    try:
+        async with _typing_forever(update):
+            await _download_to(update, context, video.file_id, path)
+            size = os.path.getsize(path)
+            focus = _caption_focus(update.message.caption)
+            prompt = mm.VISION_FRAME_PROMPT + focus
+            try:
+                result = await asyncio.to_thread(
+                    mm.analyze_video, path, 3, frame_dir)
+            except Exception as exc:
+                logger.warning("video analysis failed: %s", exc)
+                result = f"\u274C Video analysis could not run.\n\n{exc}"
+            else:
+                result = f"\U0001F3AC VIDEO - {_human_size(size)}\n" + result
+
+        await _finish_media(update, note, result)
+    except Exception as exc:
+        logger.exception("handle_video failed")
+        try:
+            await note.edit_text(f"\u274C Failed to process video: {exc}"[:4000])
+        except Exception:
+            pass
+    finally:
+        cleanup_temp_file(path)
+        shutil.rmtree(frame_dir, ignore_errors=True)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Extract text from an uploaded document and review it defensively."""
+    if not await _media_gate(update, saas.A_DOCUMENT):
+        return
+
+    doc = getattr(update.message, "document", None)
+    if doc is None:
+        await send_long(update, "No document was attached to that message.")
+        return
+
+    note = await update.message.reply_text(
+        "\U0001F4C4 Extracting text and reviewing...", parse_mode=None)
+
+    token = _short_id(doc.file_id)
+    ext = os.path.splitext(doc.file_name or "")[1] or ".bin"
+    path = _media_tmp(f"doc_{token}{ext}")
+
+    def _review():
+        """Blocking: extract text, then ask the local model to assess it."""
+        text, kind = mm.extract_text(path)
+        prompt = mm.build_document_prompt(text, kind, doc.file_name or "")
+        prompt += _caption_focus(update.message.caption)
+        analysis = ai_reply(prompt, max_tokens=900)
+        head = (f"\U0001F4C4 DOCUMENT - {doc.file_name or 'attachment'} ({kind}, "
+                f"{_human_size(os.path.getsize(path))}, {len(text)} chars)\n")
+        return head + analysis
+
+    try:
+        async with _typing_forever(update):
+            await _download_to(update, context, doc.file_id, path)
+            try:
+                result = await asyncio.to_thread(_review)
+            except RuntimeError as exc:
+                # Unsupported type / extraction problem: report it, don't crash.
+                logger.info("document rejected: %s", exc)
+                result = f"\u274C {exc}"
+            except Exception as exc:
+                logger.warning("document review failed: %s", exc)
+                result = f"\u274C Document review failed.\n\n{type(exc).__name__}: {exc}"
+
+        await _finish_media(update, note, result)
+    except Exception as exc:
+        logger.exception("handle_document failed")
+        try:
+            await note.edit_text(f"\u274C Failed to process document: {exc}"[:4000])
+        except Exception:
+            pass
+    finally:
+        cleanup_temp_file(path)
+
+
+async def my_usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /my_usage - tier, today's remaining quota and features."""
+    user = update.effective_user
+    if user is None:
+        return
+    summary = await saas.usage_summary(user.id)
+    history = await database.ahistory(user.id, limit=3)
+    text = saas.render_usage(summary)
+    if history:
+        text += "\n\nRECENT PLAN EVENTS\n" + "\n".join(
+            f"  - {h['plan']} via {h['provider']}"
+            + (f" ({h['created_at'][:10]})" if h.get("created_at") else "")
+            for h in history
+        )
+    await send_long(update, text)
+
+
+async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /upgrade - explain the plans and how to buy.
+
+    The checkout link comes from PAYMENT_CHECKOUT_URL so the bot never invents
+    a URL. Without it the operator is told to configure one rather than being
+    sent to a 404.
+    """
+    checkout = os.getenv("PAYMENT_CHECKOUT_URL", "").strip()
+    lines = [
+        "\U0001F6E8 RAVEN PLANS",
+        "-" * 34,
+    ]
+    for tier in (database.TIER_FREE, database.TIER_PRO, database.TIER_ENTERPRISE):
+        cfg = saas.tier_config(tier)
+        marks = []
+        for cap in (saas.A_TEXT, saas.A_SCAN, saas.A_IMAGE,
+                    saas.A_DOCUMENT, saas.A_VIDEO):
+            marks.append("\u2713" if cap in cfg["capabilities"] else "\u2717")
+        lines.append(f"  {cfg['label']:<11} {cfg['blurb']}")
+        lines.append(f"              {' '.join(marks)}  (chat/scan/img/doc/video)")
+
+    lines += ["", "  \u2713 = included"]
+    if checkout:
+        lines += ["", f"Checkout: {checkout}"]
+        lines += ["Your Telegram id must be attached to the payment so the",
+                  "webhook can credit your account (/start shows it)."]
+    else:
+        lines += ["", "Checkout is not configured on this deployment.",
+                  "The operator must set PAYMENT_CHECKOUT_URL in .env."]
+    await send_long(update, "\n".join(lines))
+
 # MODULE C: AUTOMATED DAILY INTELLIGENCE BRIEFINGS
 async def send_daily_briefing(bot):
     """Send daily security intelligence briefing to admin chat."""
@@ -1326,12 +1655,28 @@ def is_admin(user_id: int) -> bool:
 
     If ADMIN_USER_ID is unset the bot is open (single-user local setup);
     a warning is logged once so the owner knows the gate is disabled.
+
+    The configured value is normalised first. It is routinely pasted out of a
+    chat bubble as "(12345)" or "[12345]", and the stray bracket used to make
+    this compare against "12345)" - which silently refused /buy, /sell,
+    /trade_mode, /emergency_stop and /resume for the owner, with no obvious
+    cause. A malformed value now logs loudly and fails closed rather than
+    quietly denying everything.
     """
     admin_id = os.getenv("ADMIN_USER_ID", "").strip()
     if not admin_id:
         logger.warning("ADMIN_USER_ID not set - privileged commands are open to all users")
         return True
-    return str(user_id) == admin_id
+    cleaned = admin_id.strip("()[]{}<> \t\"'")
+    if not cleaned.isdigit():
+        logger.error(
+            "ADMIN_USER_ID=%r is not a numeric Telegram id - privileged commands "
+            "(/buy /sell /trade_mode /emergency_stop /resume) will be refused for "
+            "everyone, including you. Fix the value in .env.",
+            admin_id,
+        )
+        return False
+    return str(user_id) == cleaned
 
 
 def rate_limited(user_id: int) -> bool:
@@ -1549,13 +1894,74 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /dashboard - unified status board."""
-    await send_long(
-        update,
-        raven_analytics.system_stats(
-            time.time() - START_TIME, router=ROUTER, engine=TRADING
-        ),
+    """Handle /dashboard - unified status board, plus SaaS metrics for admins."""
+    body = raven_analytics.system_stats(
+        time.time() - START_TIME, router=ROUTER, engine=TRADING
     )
+    body += await _saas_dashboard_section(update)
+    body += _vision_capability_section()
+    await send_long(update, body)
+
+
+async def _saas_dashboard_section(update: Update) -> str:
+    """SaaS metrics. Admin-only, and omitted entirely when SaaS is off."""
+    if not SAAS_AVAILABLE:
+        return "\n\nSaaS layer: unavailable (see startup log)"
+    user = update.effective_user
+    if user is None or not is_admin(user.id):
+        return ""
+
+    stats = await database.astats()
+    by_tier = stats.get("by_tier", {})
+    lines = [
+        "",
+        "SAAS METRICS",
+        "-" * 34,
+        f"  Storage        {stats.get('storage', '?')}",
+        f"  Total users    {stats.get('total_users', 0)}",
+        f"  Free           {by_tier.get(database.TIER_FREE, 0)}",
+        f"  Pro            {by_tier.get(database.TIER_PRO, 0)}",
+        f"  Enterprise     {by_tier.get(database.TIER_ENTERPRISE, 0)}",
+        f"  Payments recd  {stats.get('subscriptions', 0)}",
+    ]
+
+    # Revenue is only reported as a plan tally. This repository has no payment
+    # processor wired up and no price table, so any currency figure would be
+    # invented. Count subscriptions per plan instead of pretending to do maths.
+    counts = await database.aplan_counts(50)
+    if counts:
+        lines.append("  Plans sold     " + ", ".join(
+            f"{k}={v}" for k, v in sorted(counts.items())))
+    else:
+        lines.append("  Plans sold     none recorded yet")
+
+    lines.append("")
+    lines.append("  Revenue: not computable here - no payment processor")
+    lines.append("  or price table is configured. Plans sold is the")
+    lines.append("  only figure this deployment can state truthfully.")
+    return "\n".join(lines)
+
+
+def _vision_capability_section() -> str:
+    """What multimodal backends are actually usable right now."""
+    if not SAAS_AVAILABLE or mm is None:
+        return ""
+    caps = mm.capabilities()
+    vis = caps["vision"]
+    lines = ["", "MULTIMODAL", "-" * 34]
+    lines.append(f"  Vision         {'ready' if vis['usable'] else 'NOT CONFIGURED'}")
+    if vis["local"]:
+        lines.append(f"    local        {vis['local_detail']}")
+    else:
+        lines.append(f"    local        {vis['local_detail']}")
+    lines.append(f"    openai       {'key set' if vis['openai'] else 'no key'}")
+    lines.append(f"    groq         {'key set' if vis['groq'] else 'no key'}")
+    doc = caps["documents"]
+    lines.append(f"  Documents      pdf={doc['pdf']} docx={doc['docx']} "
+                 f"txt/csv/json=yes")
+    vid = caps["video"]
+    lines.append(f"  Video          ffmpeg={vid['ffmpeg']} opencv={vid['opencv']}")
+    return "\n".join(lines)
 
 
 async def ai_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1729,6 +2135,54 @@ async def content_calendar_command(update: Update, context: ContextTypes.DEFAULT
 async def post_init(application):
     """Runs inside the event loop once the bot is initialized - safe place to start the scheduler."""
     setup_scheduler(application)
+    _log_startup_warnings()
+
+
+def _log_startup_warnings():
+    """Say plainly, once at boot, what is and is not actually working.
+
+    The alternative is a bot that looks fully functional and silently is not -
+    vision analysis with no vision model, an admin gate that refuses its owner,
+    tiers held in memory that vanish on restart.
+    """
+    if not os.getenv("ADMIN_USER_ID", "").strip():
+        logger.warning(
+            "ADMIN_USER_ID is not set: /buy /sell /trade_mode /emergency_stop /resume "
+            "are OPEN TO EVERYONE. Set it before sharing this bot with anyone."
+        )
+    else:
+        cleaned = os.getenv("ADMIN_USER_ID", "").strip("()[]{}<> \t\"'")
+        if not cleaned.isdigit():
+            logger.error(
+                "ADMIN_USER_ID=%r is malformed: privileged commands are refused for "
+                "everyone, including you. Fix it in .env.",
+                os.getenv("ADMIN_USER_ID"),
+            )
+        else:
+            logger.info("Admin gate active for user %s", cleaned)
+
+    if SAAS_AVAILABLE and mm is not None:
+        vis = mm.vision_status()
+        if not vis["usable"]:
+            logger.warning(
+                "No vision backend configured - images and video will return a setup "
+                "message. Fix: ollama pull %s  (or add a cloud key).",
+                mm.VISION_MODEL,
+            )
+        if not database.db_available():
+            logger.warning(
+                "SaaS database unavailable (SQLAlchemy missing?) - tiers and usage "
+                "reset on every restart."
+            )
+    elif not SAAS_AVAILABLE:
+        logger.warning(
+            "SaaS/multimodal modules did not import - /my_usage, /upgrade and media "
+            "handlers are disabled. Check the startup log."
+        )
+
+    ka = os.getenv("RAVEN_KEEP_ALIVE", "30m").strip()
+    if ka:
+        logger.info("Ollama keep-alive: %s (model stays resident between messages)", ka)
 
 async def post_shutdown(application):
     """Stop the scheduler cleanly when the bot shuts down."""
@@ -1811,8 +2265,20 @@ def main():
     application.add_handler(CommandHandler("create_content", create_content_command))
     application.add_handler(CommandHandler("content_calendar", content_calendar_command))
 
+    # SaaS tiers, quota visibility and plan information
+    if SAAS_AVAILABLE:
+        application.add_handler(CommandHandler("my_usage", my_usage_command))
+        application.add_handler(CommandHandler("upgrade", upgrade_command))
+
     # Voice message handler
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+
+    # Multimodal analysis handlers. Registered as their own group so a media
+    # message can never fall through to the plain-text chat handler.
+    if SAAS_AVAILABLE:
+        application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+        application.add_handler(MessageHandler(filters.VIDEO, handle_video))
+        application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     # Message handler for natural conversation
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

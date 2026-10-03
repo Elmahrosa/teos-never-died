@@ -176,8 +176,138 @@ Intelligence: `/crypto`, `/market`, `/leak`, `/darkweb_intel`
 AI: `/generate`, `/scrape`, `/dashboard`, `/ai_status`
 Session: `/start`, `/help`, `/clear`, `/history`, `/model`, `/system`,
 `/export`, `/tokens`, `/save`, `/load`
+SaaS: `/my_usage`, `/upgrade`
 
-Plus voice notes (hands-free) and scheduled daily briefings.
+Plus voice notes (hands-free), scheduled daily briefings, and photo / video /
+document analysis.
+
+---
+
+## Multimodal analysis
+
+RAVEN reads images, videos and documents you send it. Each upload is
+downloaded, reduced to text or frames, and reviewed defensively (hardcoded
+credentials, exposed secrets, misconfiguration, phishing indicators).
+
+| You send | What happens |
+|----------|--------------|
+| **Photo** | Largest available resolution is downloaded and analysed |
+| **Video** | 3 keyframes sampled at 10%/35%/60% through the clip, each reviewed |
+| **Document** | `.txt .md .log .pdf .docx .csv .json .yaml` - text extracted and reviewed |
+
+Add a caption to any of them and it is passed to the model as an extra
+instruction ("focus on the auth section").
+
+**Vision needs a vision model.** The default `dolphin-llama3:8b` is text-only.
+Until you provide one, image and video analysis return an honest setup message
+instead of a fabricated answer:
+
+```
+ollama pull llava          # ~4.7GB, then edit RAVEN_VISION_MODEL if you pick another
+```
+
+Alternatively add `OPENAI_API_KEY` or `GROQ_API_KEY` to `.env` and set
+`CLOUD_MEDIA_ANALYSIS=true`. Set it to `false` to guarantee uploads never leave
+the machine, even when a cloud key is present.
+
+**Video keyframes use `ffmpeg`**, which is usually already installed. If it is
+missing, install it from <https://ffmpeg.org/download.html> or run
+`pip install opencv-python`. OpenCV is only a fallback, not a requirement.
+
+Document review uses the local text model, so on a CPU-only host it is slow
+(30-145s). Adding a cloud key makes it seconds.
+
+---
+
+## SaaS tiers
+
+Users are split into three tiers, reset every UTC day:
+
+| Tier | Daily scans | Media | Image / document | Video |
+|------|-------------|-------|------------------|-------|
+| Free | 5 | none | no | no |
+| Pro | 50 | 50 | yes | no |
+| Enterprise | unlimited | unlimited | yes | yes |
+
+`/my_usage` shows the caller's tier, today's remaining quota and plan history.
+`/dashboard` adds tier counts and a plans-sold tally for the admin.
+
+**Tiers never grant trading access.** `/buy`, `/sell`, `/trade_mode`,
+`/emergency_stop` and `/resume` stay gated on `ADMIN_USER_ID` regardless of
+tier - a subscription entitles a customer to analysis, never to moving money.
+
+### Storage
+
+SQLite by default (`raven_saas.db`, created on first run, git-ignored). Point
+`DATABASE_URL` at PostgreSQL to run more than one instance:
+
+```
+DATABASE_URL=postgresql+psycopg://user:pass@host:5432/raven
+```
+
+Without SQLAlchemy installed the bot falls back to an in-memory store. It keeps
+working, but **tiers and usage reset on restart** - `/my_usage` reports
+`storage: memory` when this happens.
+
+### Payment webhook
+
+Credits paid tiers. It runs as a **separate process**, deliberately not inside
+the bot:
+
+```
+python webhook_server.py          # or: uvicorn webhook_server:app --port 8099
+```
+
+Then set `DODO_WEBHOOK_SECRET` and point your payment provider's webhook at
+`POST /webhook/payment`.
+
+The endpoint **fails closed**: with no secret configured it returns 503 and
+upgrades nobody, so a misconfigured deployment cannot be used to hand out free
+tiers. It also verifies HMAC signatures with a replay window, maps price IDs
+through a fixed allow-list (a client cannot grant itself `enterprise` by editing
+a field), remembers event ids so provider retries cannot double-credit, and
+never downgrades a customer who already holds a higher tier.
+
+`GET /health` reports whether signature verification and the database are live.
+
+> No payment provider account is wired up in this repository. The parsing is
+> written against the common shape these vendors emit and still needs one live
+> delivery against real credentials before you can rely on it.
+
+---
+
+## Speed: why replies used to feel slow
+
+Measured on a CPU-only host (4 AMD cores, no GPU, `dolphin-llama3:8b`,
+~1-2 tok/s):
+
+| Step | Cost |
+|------|------|
+| Cold model load | 130-143s |
+| Warm call, 25 prompt tokens | 4.8s |
+| Warm call, 450 prompt tokens | 234.5s |
+
+Three fixes are in place:
+
+- **`RAVEN_KEEP_ALIVE=30m`** - Ollama's default is to unload a model 5 minutes
+  after its last request, which is what made the *first* message after a break
+  look dead. The model is now held resident for 30 minutes.
+- **Streaming chat** - replies stream into a placeholder message, so you watch
+  text arrive instead of staring at a static bubble. A typing indicator is kept
+  alive throughout, and there is a non-streaming fallback so chat can never go
+  silent.
+- **Nothing blocks the event loop** - every AI call, HTTP request and file
+  parse runs in a worker thread. This was the actual cause of the old
+  "bot is unresponsive" behaviour.
+
+The full ~450-token assessment prompt costs ~234s of prefill here, which is why
+ordinary chat uses a short persona (`RAVEN_CHAT_SYSTEM_PROMPT`). Commands still
+use the complete brief.
+
+For ~2-second replies, add `GROQ_API_KEY` or `OPENAI_API_KEY` to `.env` and the
+router will fail over to the cloud automatically.
+
+---
 
 ### Files
 | File | Purpose |
@@ -188,20 +318,31 @@ Plus voice notes (hands-free) and scheduled daily briefings.
 | `raven_legacy.bat` | Original launcher (always recreates model) - kept for compatibility |
 | `install.ps1` | One-click Windows installer |
 | `requirements.txt` | pip dependencies (bot + CLI) |
-| `telegram_bot.py` | Telegram bot: all command handlers |
+| `telegram_bot.py` | Telegram bot: all command handlers, multimodal handlers |
 | `multi_provider_ai.py` | AI router with automatic failover |
 | `trading_engine.py` | Paper/live trading, risk limits, kill switch |
 | `content_creator.py` | AI captions, scripts, hashtags, calendars |
 | `social_media_manager.py` | Twitter/X posting + platform setup guides |
 | `analytics.py` | P&L reports and the system status board |
+| `database.py` | SQLAlchemy models: users, subscriptions, daily usage |
+| `saas_manager.py` | Tier definitions, quota enforcement, `@requires` decorator |
+| `multimodal_engine.py` | Vision routing, document parsing, video keyframes |
+| `webhook_server.py` | Payment webhook (separate FastAPI service) |
 | `setup_desktop.py` | Creates/removes the Desktop launchers |
 | `.env.example` | Documented configuration template |
 | `.raven_sessions/` | Directory for auto-saved and manual session files |
 | `.raven_knowledge/` | Directory for persistent knowledge base (learning system) |
+| `raven_saas.db` | SQLite database (git-ignored, created on first run) |
 | `.raven_modelfile_timestamp` | Tracks Modelfile version for smart launching |
 
 ### Note
 `raven.py` auto-installs the `ollama` pip package if missing. No manual `pip install` required.
+
+### Security note
+`ADMIN_USER_ID` must be set before sharing this bot with anyone. If it is empty
+the privileged trading commands are open to every user. A malformed value (for
+example a stray bracket pasted in as `(12345)`) is rejected at startup with a
+loud log line rather than silently refusing every request.
 
 ### Tip
 For fastest subsequent launches, use the smart `raven.bat` which only recreates the model when your Modelfile changes. Session files in `.raven_sessions/` can be periodically cleaned up with the `/cleanup` command. The knowledge base in `.raven_knowledge/` grows over time and can be managed with the knowledge base commands.
