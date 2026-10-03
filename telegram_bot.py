@@ -431,24 +431,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **Multimodal Analysis:**
 /ai_status - Which AI providers are ready
 /dashboard - Full status: usage, SaaS metrics, backends
-Send a photo, video or document and RAVEN analyses it directly.
-Supported documents: .txt .md .log .pdf .docx .csv .json .yaml
-Add a caption to any upload to tell RAVEN what to look for.
+Send a photo, video or .txt/.md/.log/.pdf/.docx/.csv/.json/.yaml document and
+RAVEN analyses it. Add a caption to tell it what to look for.
 
 **Translation:**
 /translate <lang> <text> - Translate into any of 34 languages
 /languages - List every supported language
 /detect <text> - Identify the language of a message
-Works with ar, en, fr, de, es, it, pt, ru, ja, ko, zh, hi, tr and more.
-Reply to any message with /translate <lang> to translate that instead.
-Example: /translate ar the server is down
+Includes ar, en, fr, de, es, it, pt, ru, ja, ko, zh, hi, tr. Reply to any
+message with /translate <lang> to translate that instead.
 
 **Voice Replies:**
-/voice on - Speak every reply aloud
+/voice on - Speak every reply aloud (off by default)
 /voice off - Text only
-/voice male - Deeper voice
-/voice female - Higher voice
-/voice lang <code> - Speak in another language (e.g. /voice lang ar)
+/voice male - Deeper voice      /voice female - Higher voice
+/voice lang <code> - Speak another language (e.g. /voice lang ar)
+/voice_lang <code> - Same, as its own command
 /voices [code] [male|female] - Browse available voices
 /voice_use <name> - Pin one exact voice
 
@@ -456,29 +454,39 @@ Example: /translate ar the server is down
 /my_usage - Your tier, today's quota and features
 /upgrade - Plan comparison
 
-**Trading (paper mode):**
-/trade_mode <paper|live> - Switch trading mode
-/buy <symbol> <usdt> - Buy notional USDT of a symbol
-/sell <symbol> <usdt> - Sell notional USDT of a symbol
-/positions - Open positions
-/orders - Recent trade history
+**Trading (paper mode by default):**
+/trade_mode <paper|live> - Show or change trading mode
+/buy <symbol> <usdt> - Buy notional USDT (e.g. /buy BTC 100)
+/sell <symbol> <usdt> - Sell notional USDT
+/balance - Cash, positions, equity, unrealized P&L
+/positions - Open positions with per-position P&L
+/orders [days] - Trade history
+/signal <symbol> - AI signal: bias, confidence, entry, stop, target
+/report <daily|weekly|monthly> - P&L report
 /emergency_stop - Halt all trading
 /resume - Re-enable trading after a stop
+Amounts are notional. Buy/sell/mode/stop/resume are admin-only.
+
+**Social & Content:**
+/tweet <text> - Post to Twitter/X
+/thread <topic> - AI-drafted Twitter thread
+/create_content <platform> <topic> - Caption + script + hashtags
+/content_calendar <platform> [days] - AI content calendar
+/social_status - Which social credentials are configured
+/social_guide <platform> - Step-by-step setup for a platform
+Only Twitter/X posts directly; other platforms need your own approved developer
+apps, so those commands build the content and print the setup steps.
 
 **Usage Notes:**
-- All security commands trigger RAVEN's specialized 4-phase assessment format
-- Natural conversation is also supported - just send a message
-- Session history is automatically saved and loaded
-- For best results, be specific with your targets and questions
-- Crypto commands require ccxt library: pip install ccxt
-- Voice commands require SpeechRecognition and pydub: pip install SpeechRecognition pydub
-- Daily briefings require APScheduler: pip install APScheduler
-- Real breach detection requires requests library and HIBP API key
-- Translation uses a dedicated model: ollama pull aya-expanse:8b
-- Voice replies require edge-tts and ffmpeg: pip install edge-tts
-- The first translation after a restart takes ~10 minutes while the 5GB model
-  loads from disk; later ones take 20-40 seconds. The typing indicator stays on
-  the whole time so it does not look hung.
+- Security commands trigger RAVEN's 4-phase assessment format
+- Natural conversation works too - just send a message
+- Sessions are auto-saved and restored
+- Crypto needs ccxt, voice commands need SpeechRecognition + pydub,
+  briefings need APScheduler, breach checks need a HIBP API key
+- Translation needs its own model: ollama pull aya-expanse:8b
+- Voice replies need edge-tts + ffmpeg: pip install edge-tts
+- The first translation after a restart takes ~10 minutes to load the 5GB
+  model; later ones take 20-40s. The typing indicator stays on meanwhile.
     """
     await send_long(update, help_text, parse_mode='Markdown')
 
