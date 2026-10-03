@@ -219,6 +219,109 @@ Document review uses the local text model, so on a CPU-only host it is slow
 
 ---
 
+## Translation
+
+`/translate <lang> <text>` translates into **34 languages**, including Arabic.
+Reply to any message with `/translate ar` to translate that instead of typing
+it out.
+
+```
+/languages                    # every supported language
+/detect مرحبا                 # what language is this?
+/translate ar the server is down
+/translate fr <reply to a message>
+```
+
+**Translation runs on its own model, not the chat model.** This is not a
+preference - it was measured. `dolphin-llama3:8b`, told to translate Arabic to
+Arabic, returned English. `llama3.2:3b` returned ungrammatical Arabic. Neither is
+safe to show a user as a translation.
+
+```
+ollama pull aya-expanse:8b    # ~5.1GB
+```
+
+`aya-expanse` is a translation-only model. It is deliberately *not* the chat or
+security model - it is multilingual but a poor reasoner, and you want
+`dolphin-llama3:8b` kept for security work. The two never fight over RAM.
+
+Set `RAVEN_TRANSLATE_MODEL` to use a different one. If the model is missing,
+`/translate` still runs on the chat model but **flags any reply that comes back
+in the wrong script** rather than passing it off as a translation.
+
+### How slow is it, honestly
+
+Measured on 4 AMD cores with no GPU:
+
+| | Time |
+|---|---|
+| First call after a restart | **~600s** (loads 5.1GB off disk) |
+| Every call after that | **19-39s** |
+
+`keep_alive=30m` holds the model resident, so the 10-minute cost is paid once
+per restart, not per message. The typing indicator stays on for the whole wait
+so it does not look hung. `RAVEN_TRANSLATE_TIMEOUT` defaults to `900` for this
+reason - the first call cleared 600s by less than a second, which is not a
+margin.
+
+---
+
+## Voice replies
+
+RAVEN can speak its replies aloud instead of only printing them.
+
+```
+/voice on            # speak every reply
+/voice off           # text only (this is the default)
+/voice male          # deeper voice
+/voice female        # higher voice
+/voice lang ar       # speak Arabic
+/voices ar male      # browse available voices
+/voice_use <name>    # pin one exact voice
+```
+
+**Off by default, per user.** Nothing is sent to a third-party speech service
+until someone types `/voice on`.
+
+Your text reply is always sent first. If speech fails, the text is already
+delivered and the failure is silent - voice can never cost you the answer.
+
+### Voice engine: edge-tts, not Windows SAPI
+
+`edge-tts` was chosen after measuring this machine. Windows SAPI offered exactly
+two voices, both female and English-only:
+
+| | Voices | Male | Female | Locales |
+|---|---|---|---|---|
+| Windows SAPI | 2 | 0 | 2 | 1 |
+| edge-tts | 322 | 163 | 159 | 142 |
+
+Arabic alone has 34 available voices (`ar-EG-ShakirNeural` male,
+`ar-EG-SalmaNeural` female, plus Saudi, Iraqi and Moroccan variants).
+
+```
+pip install edge-tts
+```
+
+No API key, no account. It does require **outbound internet**, because
+synthesis happens at Microsoft's endpoint. Output is transcoded to the
+`ogg/opus` format Telegram requires using the `ffmpeg` binary - the same one
+video keyframes already use. On this host synthesis takes ~1s for a 7-second
+clip.
+
+### Tier access
+
+| Tier | `/translate`, `/detect`, `/languages` | `/voice` |
+|------|----------------------------------------|----------|
+| Free | yes | no |
+| Pro | yes | yes |
+| Enterprise | yes | yes |
+
+Translation is local and costs nothing, so it is on every tier. Voice calls an
+external service, so it is counted against the daily media quota.
+
+---
+
 ## SaaS tiers
 
 Users are split into three tiers, reset every UTC day:
@@ -327,6 +430,8 @@ router will fail over to the cloud automatically.
 | `database.py` | SQLAlchemy models: users, subscriptions, daily usage |
 | `saas_manager.py` | Tier definitions, quota enforcement, `@requires` decorator |
 | `multimodal_engine.py` | Vision routing, document parsing, video keyframes |
+| `translator.py` | 34-language translation, script-based detection, script verification |
+| `voice_engine.py` | edge-tts synthesis, voice picker, ogg/opus encoding |
 | `webhook_server.py` | Payment webhook (separate FastAPI service) |
 | `setup_desktop.py` | Creates/removes the Desktop launchers |
 | `.env.example` | Documented configuration template |

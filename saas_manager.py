@@ -34,6 +34,8 @@ A_SCAN = "scan"
 A_IMAGE = "image"
 A_DOCUMENT = "document"
 A_VIDEO = "video"
+A_TRANSLATE = "translate"
+A_VOICE = "voice"
 
 UNLIMITED = -1
 
@@ -42,21 +44,22 @@ TIERS: Dict[str, Dict[str, Any]] = {
         "label": "Free",
         "daily_scans": 5,
         "daily_media": 0,
-        "capabilities": {A_TEXT},
-        "blurb": "5 scans/day - text only",
+        "capabilities": {A_TEXT, A_TRANSLATE},
+        "blurb": "5 scans/day - chat & translation",
     },
     database.TIER_PRO: {
         "label": "Pro",
         "daily_scans": 50,
         "daily_media": 50,
-        "capabilities": {A_TEXT, A_SCAN, A_IMAGE, A_DOCUMENT},
-        "blurb": "50 scans/day - adds image & document analysis",
+        "capabilities": {A_TEXT, A_TRANSLATE, A_SCAN, A_IMAGE, A_DOCUMENT, A_VOICE},
+        "blurb": "50 scans/day - adds image, document & voice replies",
     },
     database.TIER_ENTERPRISE: {
         "label": "Enterprise",
         "daily_scans": UNLIMITED,
         "daily_media": UNLIMITED,
-        "capabilities": {A_TEXT, A_SCAN, A_IMAGE, A_DOCUMENT, A_VIDEO},
+        "capabilities": {A_TEXT, A_TRANSLATE, A_SCAN, A_IMAGE, A_DOCUMENT,
+                         A_VIDEO, A_VOICE},
         "blurb": "Unlimited - adds video analysis & API access",
     },
 }
@@ -67,6 +70,10 @@ _ACTION_COUNTER = {
     A_IMAGE: "daily_media",
     A_DOCUMENT: "daily_media",
     A_VIDEO: "daily_media",
+    # Translation runs the local model, so it costs the same as a scan.
+    A_TRANSLATE: "daily_scans",
+    # Voice is metered as media: it calls out to an external speech service.
+    A_VOICE: "daily_media",
 }
 
 
@@ -80,7 +87,7 @@ def capabilities(tier: str) -> set:
 
 def limit_for(tier: str, action: str) -> int:
     cfg = tier_config(tier)
-    if action in (A_IMAGE, A_DOCUMENT, A_VIDEO):
+    if action in (A_IMAGE, A_DOCUMENT, A_VIDEO, A_VOICE):
         return cfg["daily_media"]
     return cfg["daily_scans"]
 
@@ -240,7 +247,8 @@ def render_usage(summary: Dict[str, Any]) -> str:
             "FEATURES - all unlocked",
             "  [yes] Text chat        [yes] Security scans",
             "  [yes] Image analysis   [yes] Document analysis",
-            "  [yes] Video analysis",
+            "  [yes] Video analysis   [yes] Translation",
+            "  [yes] Voice replies",
         ])
 
     icon = icons.get(summary["tier"], "\u26AA")
@@ -265,8 +273,10 @@ def render_usage(summary: Dict[str, Any]) -> str:
         A_IMAGE: "Image analysis",
         A_DOCUMENT: "Document analysis",
         A_VIDEO: "Video analysis",
+        A_TRANSLATE: "Translation",
+        A_VOICE: "Voice replies",
     }
-    for cap in (A_TEXT, A_SCAN, A_IMAGE, A_DOCUMENT, A_VIDEO):
+    for cap in (A_TEXT, A_TRANSLATE, A_SCAN, A_IMAGE, A_DOCUMENT, A_VIDEO, A_VOICE):
         mark = "yes" if cap in summary["capabilities"] else "no "
         lines.append(f"  [{mark}] {labels[cap]}")
     if summary["tier"] != database.TIER_ENTERPRISE:

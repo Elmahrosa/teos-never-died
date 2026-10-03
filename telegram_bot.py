@@ -24,11 +24,15 @@ try:
     import database
     import saas_manager as saas
     import multimodal_engine as mm
+    import translator
+    import voice_engine
     SAAS_AVAILABLE = True
 except Exception as _saas_import_error:  # pragma: no cover
     database = None
     saas = None
     mm = None
+    translator = None
+    voice_engine = None
     SAAS_AVAILABLE = False
     logging.getLogger("raven.bot").error(
         "SaaS/multimodal modules unavailable: %s", _saas_import_error)
@@ -424,6 +428,43 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /generate <topic> - Generate security reports, writeups, or documentation
 /scrape <text> - Extract key information from security texts or logs
 
+**Multimodal Analysis:**
+/ai_status - Which AI providers are ready
+/dashboard - Full status: usage, SaaS metrics, backends
+Send a photo, video or document and RAVEN analyses it directly.
+Supported documents: .txt .md .log .pdf .docx .csv .json .yaml
+Add a caption to any upload to tell RAVEN what to look for.
+
+**Translation:**
+/translate <lang> <text> - Translate into any of 34 languages
+/languages - List every supported language
+/detect <text> - Identify the language of a message
+Works with ar, en, fr, de, es, it, pt, ru, ja, ko, zh, hi, tr and more.
+Reply to any message with /translate <lang> to translate that instead.
+Example: /translate ar the server is down
+
+**Voice Replies:**
+/voice on - Speak every reply aloud
+/voice off - Text only
+/voice male - Deeper voice
+/voice female - Higher voice
+/voice lang <code> - Speak in another language (e.g. /voice lang ar)
+/voices [code] [male|female] - Browse available voices
+/voice_use <name> - Pin one exact voice
+
+**Plans & Usage:**
+/my_usage - Your tier, today's quota and features
+/upgrade - Plan comparison
+
+**Trading (paper mode):**
+/trade_mode <paper|live> - Switch trading mode
+/buy <symbol> <usdt> - Buy notional USDT of a symbol
+/sell <symbol> <usdt> - Sell notional USDT of a symbol
+/positions - Open positions
+/orders - Recent trade history
+/emergency_stop - Halt all trading
+/resume - Re-enable trading after a stop
+
 **Usage Notes:**
 - All security commands trigger RAVEN's specialized 4-phase assessment format
 - Natural conversation is also supported - just send a message
@@ -433,6 +474,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 - Voice commands require SpeechRecognition and pydub: pip install SpeechRecognition pydub
 - Daily briefings require APScheduler: pip install APScheduler
 - Real breach detection requires requests library and HIBP API key
+- Translation uses a dedicated model: ollama pull aya-expanse:8b
+- Voice replies require edge-tts and ffmpeg: pip install edge-tts
+- The first translation after a restart takes ~10 minutes while the 5GB model
+  loads from disk; later ones take 20-40 seconds. The typing indicator stays on
+  the whole time so it does not look hung.
     """
     await send_long(update, help_text, parse_mode='Markdown')
 
@@ -500,6 +546,9 @@ async def system_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 - Real Breach Data Detection (HIBP API)
 - Voice Command Processing
 - Automated Daily Briefings
+- Image / Video / Document Analysis
+- Translation (34 languages incl. Arabic)
+- Spoken Voice Replies (male or female)
 
 **Status:** 🟢 Online and ready
     """
@@ -1161,6 +1210,13 @@ async def _chat_respond(update: Update, prompt: str):
     conversation_history.append({"role": "assistant", "content": response})
     del conversation_history[:-40]  # keep the saved session bounded
     auto_save(conversation_history, current_model)
+    # Voice replies are additive: the text is already delivered by
+    # stream_ai_reply, so a failure here can never lose the answer.
+    if SAAS_AVAILABLE and voice_engine is not None:
+        try:
+            await _maybe_speak(update, response)
+        except Exception:
+            logger.debug("voice attach failed", exc_info=True)
     return response
 
 
@@ -1426,6 +1482,498 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     finally:
         cleanup_temp_file(path)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Translation (/translate /languages /detect)
+#
+# Translation runs on a dedicated model (RAVEN_TRANSLATE_MODEL) rather than the
+# security model, because aya-expanse is multilingual but a poor reasoner and
+# the reverse is also true. Blocking model calls and PDF-free text extraction
+# all run through asyncio.to_thread so the event loop keeps serving.
+# ═══════════════════════════════════════════════════════════════════════════
+def _lang_header(code: str) -> str:
+    entry = translator.LANGUAGES.get(code)
+    if not entry:
+        return code
+    return "%s (%s)" % (entry[0], entry[1])
+
+
+async def _reply_to_text(update: Update, context) -> str:
+    """Text to operate on: the argument, else the replied-to message."""
+    if context.args:
+        return " ".join(context.args).strip()
+    msg = update.message
+    replied = getattr(msg, "reply_to_message", None)
+    if replied is not None:
+        body = (replied.text or replied.caption or "").strip()
+        if body:
+            return body
+    return ""
+
+
+async def languages_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /languages - list every supported translation language."""
+    # translation_status() probes Ollama; run it off the loop so an unreachable
+    # Ollama cannot stall the bot for the length of the HTTP timeout.
+    status = await asyncio.to_thread(translator.translation_status)
+    rows = translator.list_languages()
+    lines = ["\U0001F310 TRANSLATION LANGUAGES (%d)" % len(rows), ""]
+    for i in range(0, len(rows), 2):
+        pair = rows[i:i + 2]
+        cells = ["%-5s %-14s" % (r["code"], r["name"]) for r in pair]
+        lines.append("  " + "".join(cells))
+    lines += [
+        "",
+        "Use the code or the name:",
+        "  /translate ar <text>",
+        "  /translate arabic <text>",
+        "  /translate العربية <text>",
+        "Reply to any message with /translate <lang> to translate that instead.",
+        "",
+        "ENGINE",
+        "  model    %s%s" % (
+            status["in_use"],
+            "" if status["dedicated"] else "  (dedicated model not installed)"),
+        "  detect   %s" % ("langdetect, offline"
+                           if status["detection"] else "NOT AVAILABLE"),
+        "  limit    %d chars per message" % status["max_chars"],
+    ]
+    if not status["dedicated"]:
+        lines.append("")
+        lines.append("  To add full Arabic/Thai/Korean quality:")
+        lines.append("    ollama pull %s" % status["translate_model"])
+        lines.append("  Until then the chat model is used, and any reply that")
+        lines.append("  comes back in the wrong script is flagged to you.")
+    await send_long(update, "\n".join(lines))
+
+
+async def detect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /detect <text> - identify the language of a message."""
+    text = await _reply_to_text(update, context)
+    if not text:
+        await send_long(update,
+                        "\U0001F50E Send some text or reply to a message.\n"
+                        "Usage: /detect your text here")
+        return
+    if not translator.LANGDETECT_AVAILABLE:
+        await send_long(update,
+                        "❌ Language detection unavailable.\n"
+                        "Install with: pip install langdetect")
+        return
+    result = await asyncio.to_thread(translator.detect_ex, text)
+    code = result["code"]
+
+    if code and result["confident"]:
+        await send_long(update,
+                        "\U0001F50E Detected: %s\n   code: %s   "
+                        "confidence: %.0f%%\n\n"
+                        "Translate it: /translate %s (replying to this message)"
+                        % (_lang_header(code), code, result["confidence"] * 100,
+                           code))
+        return
+
+    # Low confidence: langdetect is guessing on a short sample. Saying so is
+    # more useful than asserting "Finnish" because someone typed "hello".
+    guesses = [g for g in result["candidates"]][:3]
+    detail = "\n".join(
+        "   %-8s %-14s %.0f%%" % (
+            g["code"],
+            translator.language_name(g["code"])
+            if g["code"] in translator.LANGUAGES else g["code"],
+            g["confidence"] * 100)
+        for g in guesses)
+    lines = [
+        "\U0001F50E Not confident about that one.",
+        "",
+        "   best guesses:",
+        detail,
+        "",
+        "Short greetings are genuinely ambiguous - \"hello\" is statistically",
+        "as likely Finnish or Croatian as English. Send a longer message and",
+        "I can be precise.",
+    ]
+    if code:
+        lines.append("")
+        lines.append("If that first guess is right: /translate %s" % code)
+    await send_long(update, "\n".join(lines))
+
+
+async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /translate <lang> <text> - translate into any supported language.
+
+    Replies are also spoken when the user has voice on and the translation came
+    from a non-Latin script, because reading Arabic as text is awkward for
+    many users.
+    """
+    user = update.effective_user
+    if user is None:
+        return
+
+    args = context.args
+    target_tok = args[0] if args else ""
+    body = " ".join(args[1:]).strip()
+    if not body:
+        # Allow /translate ar on a reply, and bare /translate to reuse the
+        # user's saved language.
+        replied = getattr(update.message, "reply_to_message", None)
+        if replied is not None:
+            body = (replied.text or replied.caption or "").strip()
+    if not target_tok:
+        prefs = await database.aget_prefs(user.id)
+        target_tok = prefs.get("translate_lang") or ""
+        if not target_tok:
+            await send_long(update,
+                            "\U0001F310 Which language?\n"
+                            "  /translate ar <text>\n"
+                            "  /languages to see all 34\n"
+                            "  Or reply to a message with /translate <lang>")
+            return
+    if not body:
+        await send_long(update,
+                        "\U0001F310 Nothing to translate.\n"
+                        "Usage: /translate <lang> <text>\n"
+                        "Or reply to a message with /translate <lang>\n"
+                        "Example: /translate arabic the server is down")
+        return
+
+    target = translator.resolve(target_tok)
+    if not target:
+        await send_long(update,
+                        "❓ I don't support '%s'.\n\n"
+                        "/languages lists all %d. Arabic works too:\n"
+                        "  /translate ar <text>"
+                        % (target_tok, len(translator.LANGUAGES)))
+        return
+
+    if not await _media_gate(update, saas.A_TRANSLATE):
+        return
+
+    note = await update.message.reply_text(
+        "\U0001F310 Translating to %s..." % translator.language_name(target))
+
+    try:
+        async with _typing_forever(update):
+            result = await asyncio.to_thread(translator.translate, body, target)
+    except RuntimeError as exc:
+        await note.edit_text(str(exc)[:1900])
+        return
+    except Exception:
+        logger.exception("translation failed")
+        await note.edit_text("❌ Translation failed unexpectedly.")
+        return
+
+    header = "\U0001F310 %s  \U0001F449  %s\n%s" % (
+        _lang_header(result["source"]),
+        _lang_header(result["target"]),
+        "─" * 30,
+    )
+    if result["warning"]:
+        # The model ignored the instruction or produced text in the wrong
+        # script. Say so rather than presenting English as an Arabic
+        # translation.
+        header += (
+            "\n⚠️ WARNING: I asked for %s but the model replied with no %s "
+            "characters, so this is probably NOT a real translation.\n"
+            "   Fix: ollama pull %s\n%s\n"
+            % (result["target_name"], result["target_name"],
+               translator.TRANSLATE_MODEL, "─" * 30)
+        )
+    await note.edit_text(header + "\n" + result["text"][:3500])
+
+    if target_tok:
+        try:
+            await database.aset_prefs(user.id, translate_lang=target)
+        except Exception:
+            logger.debug("could not save translate_lang", exc_info=True)
+
+    await _maybe_speak(update, header + "\n" + result["text"],
+                       force=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Voice replies (/voice /voices)
+#
+# Off by default and per user. Long security reports read badly as audio, so
+# nothing speaks unless the user asked for it. Synthesis is ~1s and the ffmpeg
+# transcode runs in a worker thread.
+# ═══════════════════════════════════════════════════════════════════════════
+VOICE_TMP_DIR = os.getenv("RAVEN_VOICE_TMP", os.path.join(MEDIA_TMP_DIR, "voice"))
+
+
+class _SubArgs:
+    """Adapter so /voice male can reuse the /voice_male handler body."""
+
+    def __init__(self, args):
+        if isinstance(args, str):
+            args = [args]
+        self.args = list(args) if args else []
+
+
+async def _send_voice(update: Update, text: str, prefs: dict,
+                      force: bool = False) -> bool:
+    """Attach a spoken version of `text` to an existing text reply.
+
+    Returns True when a voice note was delivered. Never raises: a voice failure
+    must not lose the text reply the user already has.
+    """
+    if not text or not voice_engine.status()["usable"]:
+        return False
+    if not force and not prefs.get("voice_on"):
+        return False
+    try:
+        result = await voice_engine.speak(
+            text,
+            lang=prefs.get("voice_lang") or "en-US",
+            gender=prefs.get("voice_gender") or "female",
+            voice=prefs.get("voice_name") or None,
+            out_dir=VOICE_TMP_DIR,
+        )
+    except RuntimeError as exc:
+        logger.info("voice note skipped: %s", exc)
+        return False
+    except Exception:
+        logger.warning("voice note failed", exc_info=True)
+        return False
+
+    try:
+        with open(result["path"], "rb") as fh:
+            await update.message.reply_voice(
+                voice=fh,
+                duration=result["duration"] or None,
+                caption=("\U0001F5E3 %s" % result["voice"])[:200],
+            )
+        return True
+    except Exception:
+        logger.warning("could not deliver voice note", exc_info=True)
+        return False
+    finally:
+        voice_engine.cleanup(result["path"])
+
+
+async def _maybe_speak(update: Update, text: str, force: bool = False) -> bool:
+    """Speak `text` only when this user has voice enabled."""
+    user = getattr(update, "effective_user", None)
+    if user is None:
+        return False
+    try:
+        prefs = await database.aget_prefs(user.id)
+    except Exception:
+        logger.debug("could not read voice prefs", exc_info=True)
+        return False
+    return await _send_voice(update, text, prefs, force=force)
+
+
+async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /voice on|off|male|female|lang <code>|status."""
+    user = update.effective_user
+    if user is None:
+        return
+    arg = (context.args[0].lower() if context.args else "").strip()
+
+    if not voice_engine.status()["usable"]:
+        needs = "\n".join("- " + n for n in voice_engine.status()["needs"])
+        await send_long(update,
+                        "❌ Voice output is not available yet.\n\n%s" % needs)
+        return
+
+    prefs = await database.aget_prefs(user.id)
+
+    # Subcommands, so /voice male and /voice lang ar work without a separate
+    # command name each.
+    if arg in ("male", "man", "female", "woman"):
+        # Wrap in a list: passing the bare string would be iterated into
+        # individual characters.
+        await voice_gender_command(update, _SubArgs([arg]))
+        return
+    if arg in ("lang", "language"):
+        await voice_lang_command(update, _SubArgs(context.args[1:]))
+        return
+
+    if arg in ("status", "show"):
+        await _voice_status(update, prefs)
+        return
+    if arg in ("off", "stop", "disable"):
+        await database.aset_prefs(user.id, voice_on=False)
+        await send_long(update,
+                        "\U0001F507 Voice replies off.\n"
+                        "Replies stay text-only.")
+        return
+    if arg in ("on", "enable", "start"):
+        allowed, reason = await saas.evaluate(user.id, saas.A_VOICE,
+                                             is_admin=is_admin(user.id))
+        if not allowed:
+            await send_long(update, reason)
+            return
+        await database.aset_prefs(user.id, voice_on=True)
+        prefs = await database.aget_prefs(user.id)
+        await _voice_status(update, prefs, just_enabled=True)
+        return
+
+    await _voice_status(update, prefs, help_hint=True)
+
+
+async def _voice_status(update: Update, prefs: dict,
+                        just_enabled: bool = False,
+                        help_hint: bool = False) -> None:
+    lang = prefs.get("voice_lang") or "en-US"
+    gender = prefs.get("voice_gender") or "female"
+    chosen = prefs.get("voice_name") or ""
+    if not chosen:
+        chosen = await voice_engine.pick_voice(lang, gender)
+    state = "ON" if prefs.get("voice_on") else "OFF"
+    lines = [
+        "\U0001F3A4 VOICE REPLIES: %s" % state,
+        "─" * 30,
+        "  Voice    %s" % chosen,
+        "  Language %s" % lang,
+        "  Gender   %s" % gender,
+    ]
+    if just_enabled:
+        ok = await _send_voice(update, lines[0], prefs, force=True)
+        lines.append("")
+        if ok:
+            lines.append("\U0001F3A4 \U0001F3A4 Here is how I sound.")
+            lines.append("Turn it off with /voice off")
+        else:
+            lines.append("Enabled, but the test clip did not send.")
+    elif help_hint:
+        lines += [
+            "",
+            "  /voice on            speak my replies",
+            "  /voice off           text only",
+            "  /voice male          deeper voice",
+            "  /voice female        higher voice",
+            "  /voice lang <code>   speak another language",
+            "  /voices              browse available voices",
+            "",
+            "Long security reports are still sent as text as well.",
+        ]
+    await send_long(update, "\n".join(lines))
+
+
+async def voice_gender_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /voice male|female - pick a voice register."""
+    user = update.effective_user
+    if user is None:
+        return
+    want = (context.args[0].lower() if context.args else "").strip()
+    if want not in ("male", "female", "man", "woman"):
+        await send_long(update,
+                        "Usage: /voice male   or   /voice female")
+        return
+    gender = "male" if want in ("male", "man") else "female"
+    prefs = await database.aget_prefs(user.id)
+    lang = prefs.get("voice_lang") or "en-US"
+    chosen = await voice_engine.pick_voice(lang, gender)
+    # Clear any explicit voice so the gender choice actually takes effect.
+    await database.aset_prefs(user.id, voice_gender=gender, voice_name="")
+    await send_long(update,
+                    "\U0001F3A4 Voice set to %s: %s\nNow speaking as %s.\n"
+                    "%s" % (gender, chosen, gender,
+                            "Play a test below." if prefs.get("voice_on")
+                            else "Voice replies are off - use /voice on"))
+    await _send_voice(update, "This is my %s voice." % gender, prefs,
+                      force=True)
+
+
+async def voice_lang_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /voice lang <code> - speak replies in another language."""
+    user = update.effective_user
+    if user is None:
+        return
+    if not context.args:
+        await send_long(update,
+                        "Usage: /voice lang <code>\n"
+                        "Example: /voice lang ar\n"
+                        "/languages lists the codes I know.")
+        return
+    tok = context.args[0]
+    code = translator.resolve(tok)
+    if not code:
+        await send_long(update,
+                        "❓ I don't have voices for '%s'.\n"
+                        "Try: /voice lang en   (or ar, fr, de, es, ...)"
+                        % tok)
+        return
+    # edge-tts exposes voices far beyond the translation set, so accept any
+    # locale the catalogue actually has, not only LANGUAGES keys.
+    base = code
+    available = await voice_engine.list_voices(base, None)
+    if not available:
+        await send_long(update,
+                        "❓ No voices found for '%s'." % tok)
+        return
+    prefs = await database.aget_prefs(user.id)
+    gender = prefs.get("voice_gender") or "female"
+    lang = available[0]["locale"]
+    chosen = await voice_engine.pick_voice(lang, gender)
+    await database.aset_prefs(user.id, voice_lang=lang, voice_name="")
+    await send_long(update,
+                    "\U0001F3A4 Spoken language set to %s\nVoice: %s"
+                    % (lang, chosen))
+    await _send_voice(update, "Now I will speak %s." % lang, prefs,
+                      force=True)
+
+
+async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /voices [code] [male|female] - browse available voices."""
+    user = update.effective_user
+    prefs = await database.aget_prefs(user.id) if user else {}
+    code = "en"
+    gender = ""
+    for arg in (context.args or []):
+        a = arg.lower()
+        if a in ("male", "man", "female", "woman"):
+            gender = "male" if a in ("male", "man") else "female"
+        elif translator.resolve(a) or len(a) >= 2:
+            code = a
+    voices = await voice_engine.list_voices(code, gender or None)
+    if not voices:
+        await send_long(update,
+                        "❓ No voices for '%s'%s.\nTry /languages for a code."
+                        % (code, (" " + gender) if gender else ""))
+        return
+    total = len(await voice_engine.list_voices())
+    lines = ["\U0001F3A4 VOICES: %s%s  (%d of %d total)" % (
+        code.upper(), (" " + gender) if gender else "", len(voices), total), ""]
+    for v in voices[:30]:
+        lines.append("  %-38s %s" % (v["name"], v["gender"][:1].upper()))
+    if len(voices) > 30:
+        lines.append("  ... and %d more" % (len(voices) - 30))
+    lines += [
+        "",
+        "Use one with:  /voice_use " + voices[0]["name"],
+        "Gender presets: /voice male   /voice female",
+    ]
+    await send_long(update, "\n".join(lines))
+
+
+async def voice_use_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /voice_use <ShortName> - pin an exact voice."""
+    user = update.effective_user
+    if user is None:
+        return
+    if not context.args:
+        await send_long(update, "Usage: /voice_use en-US-GuyNeural\n"
+                                "/voices lists them.")
+        return
+    name = context.args[0].strip()
+    if not await voice_engine.validate_voice(name):
+        await send_long(update,
+                        "❓ No voice called '%s'.\n/voices lists the real names."
+                        % name)
+        return
+    locale = ""
+    for v in await voice_engine.list_voices():
+        if v["name"] == name:
+            locale = v["locale"]
+            break
+    await database.aset_prefs(user.id, voice_name=name, voice_lang=locale)
+    await send_long(update, "\U0001F3A4 Voice pinned: %s\nLanguage: %s"
+                    % (name, locale))
+    prefs = await database.aget_prefs(user.id)
+    await _send_voice(update, "This is my voice now.", prefs, force=True)
 
 
 async def my_usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1900,6 +2448,7 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     body += await _saas_dashboard_section(update)
     body += _vision_capability_section()
+    body += _language_capability_section()
     await send_long(update, body)
 
 
@@ -1961,6 +2510,34 @@ def _vision_capability_section() -> str:
                  f"txt/csv/json=yes")
     vid = caps["video"]
     lines.append(f"  Video          ffmpeg={vid['ffmpeg']} opencv={vid['opencv']}")
+    return "\n".join(lines)
+
+
+def _language_capability_section() -> str:
+    """What translation and voice can actually do right now.
+
+    Relies on the model cache warmed at boot by _log_startup_warnings(); this
+    runs synchronously inside dashboard_command and must not do network I/O.
+    """
+    if not SAAS_AVAILABLE or translator is None or voice_engine is None:
+        return ""
+    t = translator.translation_status()
+    v = voice_engine.status()
+    lines = ["", "LANGUAGE & VOICE", "-" * 34]
+    lines.append(f"  Translate      {t['languages']} languages")
+    if t["dedicated"]:
+        lines.append(f"    model        {t['in_use']} (dedicated)")
+    else:
+        lines.append(f"    model        {t['in_use']}  <- chat model, NOT dedicated")
+        lines.append(f"    fix          ollama pull {t['translate_model']}")
+    lines.append(f"    detection    {'langdetect' if t['detection'] else 'MISSING'}")
+    lines.append(f"    cold start   ~600s on this CPU, ~20-40s once resident")
+    if v["usable"]:
+        lines.append("  Voice          ready (edge-tts -> ogg/opus)")
+    else:
+        lines.append("  Voice          NOT AVAILABLE")
+        for need in v["needs"]:
+            lines.append(f"    needs        {need}")
     return "\n".join(lines)
 
 
@@ -2169,6 +2746,37 @@ def _log_startup_warnings():
                 "message. Fix: ollama pull %s  (or add a cloud key).",
                 mm.VISION_MODEL,
             )
+        else:
+            logger.info("Vision backend ready: %s", vis["local_detail"])
+
+        if translator is not None:
+            # Warm the model cache at boot so the first /translate or /languages
+            # does not pay a probe on the event loop.
+            t = translator.translation_status()
+            if t["dedicated"]:
+                logger.info("Translation model ready: %s (%d languages)",
+                            t["in_use"], t["languages"])
+            else:
+                logger.warning(
+                    "No dedicated translation model - /translate will use %s, which "
+                    "cannot write Arabic and will return English instead. "
+                    "Fix: ollama pull %s",
+                    t["in_use"], t["translate_model"],
+                )
+            if not t["detection"]:
+                logger.warning(
+                    "langdetect is not installed - /detect will not work. "
+                    "Fix: pip install langdetect")
+
+        if voice_engine is not None:
+            v = voice_engine.status()
+            if v["usable"]:
+                logger.info("Voice replies ready (edge-tts -> ogg/opus)")
+            else:
+                logger.warning(
+                    "Voice replies unavailable - %s. /voice will explain.",
+                    "; ".join(v["needs"]))
+
         if not database.db_available():
             logger.warning(
                 "SaaS database unavailable (SQLAlchemy missing?) - tiers and usage "
@@ -2269,6 +2877,17 @@ def main():
     if SAAS_AVAILABLE:
         application.add_handler(CommandHandler("my_usage", my_usage_command))
         application.add_handler(CommandHandler("upgrade", upgrade_command))
+
+        # Translation. Translation itself runs on the local model, so it is
+        # available on every tier; voice is Pro+ because it calls an external
+        # speech service.
+        application.add_handler(CommandHandler("translate", translate_command))
+        application.add_handler(CommandHandler("languages", languages_command))
+        application.add_handler(CommandHandler("detect", detect_command))
+        application.add_handler(CommandHandler("voice", voice_command))
+        application.add_handler(CommandHandler("voice_lang", voice_lang_command))
+        application.add_handler(CommandHandler("voice_use", voice_use_command))
+        application.add_handler(CommandHandler("voices", voices_command))
 
     # Voice message handler
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))

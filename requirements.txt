@@ -38,3 +38,12 @@ PyPDF2
 python-docx
 fastapi
 uvicorn
+
+# Translation and voice.
+# langdetect is pure Python and runs offline for /detect.
+langdetect>=1.0.9
+# edge-tts reaches Microsoft's neural speech endpoint with no API key and no
+# account. It needs outbound internet. Output is transcoded to the ogg/opus
+# format Telegram requires using the `ffmpeg` binary, the same one video
+# keyframe extraction already uses.
+edge-tts>=6.1

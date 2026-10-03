@@ -56,6 +56,7 @@ def today_str() -> str:
 # ---------------------------------------------------------------------------
 try:
     from sqlalchemy import (  # type: ignore
+        Boolean,
         Column,
         DateTime,
         Integer,
@@ -63,6 +64,8 @@ try:
         Text,
         UniqueConstraint,
         create_engine,
+        inspect,
+        text as _sql_text,
     )
     from sqlalchemy.orm import declarative_base, sessionmaker  # type: ignore
 
@@ -89,6 +92,13 @@ if _HAVE_SQLALCHEMY:
         username = Column(String(128), default="")
         tier = Column(String(32), default=TIER_FREE, nullable=False)
         api_key = Column(String(128), default="", nullable=False)
+        # Voice / translation preferences. Added after the first release, so
+        # existing databases get them via _migrate_columns() below.
+        voice_on = Column(Boolean, default=False, nullable=False)
+        voice_lang = Column(String(16), default="en-US", nullable=False)
+        voice_gender = Column(String(16), default="female", nullable=False)
+        voice_name = Column(String(64), default="")
+        translate_lang = Column(String(16), default="", nullable=False)
         created_at = Column(DateTime, default=_utcnow)
         last_seen = Column(DateTime, default=_utcnow)
 
@@ -141,6 +151,7 @@ def init_db() -> bool:
                 kwargs["connect_args"] = {"check_same_thread": False}
             engine = create_engine(url, **kwargs)
             Base.metadata.create_all(engine)
+            _migrate_columns(engine)
             _engine = engine
             _SessionFactory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
             logger.info("SaaS database ready (%s)", url.split("://")[0])
@@ -152,6 +163,40 @@ def init_db() -> bool:
 
 def db_available() -> bool:
     return init_db()
+
+
+# Columns added after the first release. `create_all` never alters an existing
+# table, so an already-created raven_saas.db would raise OperationalError on
+# the first SELECT of a new column. Adding them explicitly keeps upgrades
+# non-destructive: existing rows keep their tier and history.
+_ADDED_COLUMNS = (
+    ("users", "voice_on", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("users", "voice_lang", "VARCHAR(16) NOT NULL DEFAULT 'en-US'"),
+    ("users", "voice_gender", "VARCHAR(16) NOT NULL DEFAULT 'female'"),
+    ("users", "voice_name", "VARCHAR(64) NOT NULL DEFAULT ''"),
+    ("users", "translate_lang", "VARCHAR(16) NOT NULL DEFAULT ''"),
+)
+
+
+def _migrate_columns(engine) -> None:
+    """Add any missing columns. Never drops or rewrites data."""
+    try:
+        insp = inspect(engine)
+        tables = set(insp.get_table_names())
+        with engine.begin() as conn:
+            for table, column, ddl in _ADDED_COLUMNS:
+                if table not in tables:
+                    continue
+                existing = {c["name"] for c in insp.get_columns(table)}
+                if column in existing:
+                    continue
+                conn.execute(_sql_text(
+                    "ALTER TABLE %s ADD COLUMN %s %s" % (table, column, ddl)))
+                logger.info("Migrated: added %s.%s", table, column)
+    except Exception:
+        # A failed migration must not stop the bot; the column read below is
+        # guarded, and the next start retries.
+        logger.warning("column migration skipped", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +212,11 @@ def _get_user(telegram_id: str, username: str = "") -> Dict[str, Any]:
                     "username": username,
                     "tier": TIER_FREE,
                     "api_key": "",
+                    "voice_on": False,
+                    "voice_lang": "en-US",
+                    "voice_gender": "female",
+                    "voice_name": "",
+                    "translate_lang": "",
                     "created_at": _utcnow().isoformat(),
                     "last_seen": _utcnow().isoformat(),
                 },
@@ -194,11 +244,69 @@ def _get_user(telegram_id: str, username: str = "") -> Dict[str, Any]:
                 "username": row.username or "",
                 "tier": row.tier or TIER_FREE,
                 "has_api_key": bool(row.api_key),
+                "voice_on": bool(row.voice_on),
+                "voice_lang": row.voice_lang or "en-US",
+                "voice_gender": row.voice_gender or "female",
+                "voice_name": row.voice_name or "",
+                "translate_lang": row.translate_lang or "",
                 "created_at": row.created_at.isoformat() if row.created_at else None,
                 "last_seen": row.last_seen.isoformat() if row.last_seen else None,
             }
         finally:
             session.close()
+
+
+# Preference columns that users may set. Whitelisted so no caller can use this
+# to write `tier` or `api_key` by passing a field name through.
+_PREF_COLUMNS = ("voice_on", "voice_lang", "voice_gender", "voice_name",
+                 "translate_lang")
+
+
+def _set_prefs(telegram_id: str, prefs: Dict[str, Any]) -> bool:
+    """Update voice/translation preferences. Unknown keys are ignored."""
+    if not init_db():
+        with _lock:
+            rec = _memory["users"].setdefault(
+                str(telegram_id),
+                {"telegram_id": str(telegram_id), "username": "",
+                 "tier": TIER_FREE, "api_key": "", "voice_on": False,
+                 "voice_lang": "en-US", "voice_gender": "female",
+                 "voice_name": "", "translate_lang": "",
+                 "created_at": _utcnow().isoformat(),
+                 "last_seen": _utcnow().isoformat()},
+            )
+            rec.update({k: v for k, v in prefs.items() if k in _PREF_COLUMNS})
+            return True
+
+    clean = {k: v for k, v in prefs.items() if k in _PREF_COLUMNS}
+    if not clean:
+        return False
+    with _lock:
+        session = _SessionFactory()
+        try:
+            row = session.query(User).filter(
+                User.telegram_id == str(telegram_id)).one_or_none()
+            if row is None:
+                row = User(telegram_id=str(telegram_id), username="",
+                           tier=TIER_FREE, api_key="", created_at=_utcnow(),
+                           last_seen=_utcnow())
+                session.add(row)
+            for key, value in clean.items():
+                setattr(row, key, value)
+            session.commit()
+            return True
+        except Exception:
+            logger.warning("preference write failed for %s", telegram_id,
+                           exc_info=True)
+            return False
+        finally:
+            session.close()
+
+
+def _get_prefs(telegram_id: str) -> Dict[str, Any]:
+    """Preferences only, without touching tier or the username."""
+    user = _get_user(telegram_id)
+    return {k: user.get(k) for k in _PREF_COLUMNS}
 
 
 def _set_tier(telegram_id: str, tier: str, plan: Optional[str] = None,
@@ -398,6 +506,15 @@ async def ahistory(telegram_id: str, limit: int = 5) -> List[Dict[str, Any]]:
 
 async def aplan_counts(limit: int = 1000) -> Dict[str, int]:
     return await asyncio.to_thread(_plan_counts, limit)
+
+
+async def aset_prefs(telegram_id: str, **prefs: Any) -> bool:
+    """Persist voice/translation preferences off the event loop."""
+    return await asyncio.to_thread(_set_prefs, str(telegram_id), prefs)
+
+
+async def aget_prefs(telegram_id: str) -> Dict[str, Any]:
+    return await asyncio.to_thread(_get_prefs, str(telegram_id))
 
 
 if __name__ == "__main__":  # pragma: no cover - manual smoke check
