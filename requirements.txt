@@ -1,1 +1,8 @@
 ollama
+python-telegram-bot
+ccxt
+python-dotenv
+requests
+SpeechRecognition
+pydub
+APScheduler
