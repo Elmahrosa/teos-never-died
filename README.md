@@ -91,6 +91,94 @@ Type these commands during a RAVEN session:
 - `/export`: Export history to markdown file
 - `exit`: Quit RAVEN
 
+---
+
+## Telegram Bot (`telegram_bot.py`)
+
+The same brain, driven from Telegram. Setup:
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env        # Windows: copy .env.example .env
+# fill in TELEGRAM_TOKEN, RAVEN_MODEL, ADMIN_USER_ID
+python setup_desktop.py     # create the Desktop shortcuts
+python telegram_bot.py
+```
+
+`setup_desktop.py` resolves the Desktop through the Windows shell, so it also
+works on OneDrive-redirected profiles. It creates:
+
+| Entry | What it does |
+|-------|--------------|
+| `Start_RAVEN_Hidden.vbs` | Launches RAVEN with no console window |
+| `RAVEN_24_7_Shortcut.lnk` | Shortcut to the silent launcher |
+| `Stop_RAVEN.bat` | Kills **only** `telegram_bot.py` (other Python programs are untouched) |
+| `RAVEN_Config.lnk` | Opens `.env` in Notepad |
+
+Remove them again with `python setup_desktop.py --remove`.
+
+### AI failover
+
+`multi_provider_ai.py` walks a priority list and fails over automatically:
+
+```
+ollama -> openai -> anthropic -> groq -> huggingface
+```
+
+Providers without a key in `.env` are skipped. `/ai_status` shows which are
+live. Cloud providers are called over plain HTTPS, so no vendor SDKs are needed.
+
+### Trading
+
+`trading_engine.py` defaults to **paper mode** — simulated fills at live market
+prices, so nothing real can happen by accident.
+
+- Amounts are notional: `/buy BTC 100` buys $100 of BTC
+- Guardrails: `MAX_POSITION_USDT` per position, `DAILY_LOSS_LIMIT_PCT` circuit
+  breaker, per-user rate limiting, admin-only buy/sell
+- `/emergency_stop` halts all trading; `/resume` re-enables it
+- Live mode requires `TRADING_MODE=live` **and** exchange keys that have TRADE
+  permission only — never withdrawal
+
+| Command | Purpose |
+|---------|---------|
+| `/balance` | Cash, positions, equity, unrealized P&L |
+| `/positions` | Open positions with per-position P&L |
+| `/buy`, `/sell` | Market order, notional in USDT |
+| `/orders [days]` | Trade history |
+| `/signal <symbol>` | AI signal: bias, confidence, entry, stop-loss, take-profit |
+| `/report <daily\|weekly\|monthly>` | P&L report |
+| `/trade_mode [paper\|live]` | Show or change mode |
+| `/emergency_stop`, `/resume` | Kill switch |
+
+Paper state lives in `raven_portfolio.json` / `raven_trades.json` (git-ignored).
+Delete them to reset the paper account.
+
+### Social & content
+
+| Command | Purpose |
+|---------|---------|
+| `/tweet <text>` | Post to Twitter/X (needs `tweepy` + API keys) |
+| `/thread <topic>` | AI-drafted Twitter thread |
+| `/create_content <platform> <topic>` | Caption + 60s script + hashtags |
+| `/content_calendar <platform> [days]` | AI content calendar |
+| `/social_status`, `/social_guide <platform>` | Credential status and setup steps |
+
+Only Twitter/X can post directly from the bot. TikTok, YouTube and Instagram
+require approved developer apps and OAuth, so those commands generate the
+content package and tell you how to finish the setup — they never fake a
+successful post.
+
+### Existing bot commands
+
+Security: `/scan`, `/cve`, `/exploit`, `/harden`, `/analyze`
+Intelligence: `/crypto`, `/market`, `/leak`, `/darkweb_intel`
+AI: `/generate`, `/scrape`, `/dashboard`, `/ai_status`
+Session: `/start`, `/help`, `/clear`, `/history`, `/model`, `/system`,
+`/export`, `/tokens`, `/save`, `/load`
+
+Plus voice notes (hands-free) and scheduled daily briefings.
+
 ### Files
 | File | Purpose |
 |------|---------|
@@ -99,7 +187,15 @@ Type these commands during a RAVEN session:
 | `raven.bat` | **Smart** Windows launcher (checks model status before creating) |
 | `raven_legacy.bat` | Original launcher (always recreates model) - kept for compatibility |
 | `install.ps1` | One-click Windows installer |
-| `requirements.txt` | pip dependency (`ollama`) |
+| `requirements.txt` | pip dependencies (bot + CLI) |
+| `telegram_bot.py` | Telegram bot: all command handlers |
+| `multi_provider_ai.py` | AI router with automatic failover |
+| `trading_engine.py` | Paper/live trading, risk limits, kill switch |
+| `content_creator.py` | AI captions, scripts, hashtags, calendars |
+| `social_media_manager.py` | Twitter/X posting + platform setup guides |
+| `analytics.py` | P&L reports and the system status board |
+| `setup_desktop.py` | Creates/removes the Desktop launchers |
+| `.env.example` | Documented configuration template |
 | `.raven_sessions/` | Directory for auto-saved and manual session files |
 | `.raven_knowledge/` | Directory for persistent knowledge base (learning system) |
 | `.raven_modelfile_timestamp` | Tracks Modelfile version for smart launching |

@@ -1,8 +1,25 @@
-ollama
-python-telegram-bot
-ccxt
+# ── RAVEN core ────────────────────────────────────────────
+python-telegram-bot>=20.0
 python-dotenv
 requests
+ollama
+APScheduler
+
+# ── Market data & trading ─────────────────────────────────
+ccxt
+
+# ── Voice commands ────────────────────────────────────────
 SpeechRecognition
 pydub
-APScheduler
+
+# ── Desktop shortcuts (setup_desktop.py) ──────────────────
+pywin32>=306 ; sys_platform == "win32"
+
+# ── Optional extras ───────────────────────────────────────
+# Install only what you need. The bot degrades gracefully without them.
+#
+# tweepy            -> /tweet and /thread actually post to Twitter/X
+# pytest            -> unit tests
+#
+# Note: AI providers (OpenAI / Anthropic / Groq / HuggingFace) are called
+# over plain HTTPS with `requests`, so no vendor SDKs are required.

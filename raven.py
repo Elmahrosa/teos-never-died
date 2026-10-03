@@ -188,7 +188,12 @@ def now_str():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def get_reply(model, messages, stream):
+def get_reply(model, messages, stream=False):
+    """Send `messages` to the local Ollama model and return the reply text.
+
+    `stream` defaults to False so callers that only pass (model, messages)
+    work unchanged. The Telegram bot relies on this default.
+    """
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:

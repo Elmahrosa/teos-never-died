@@ -55,10 +55,20 @@ except ImportError:
     APSCHEDULER_AVAILABLE = False
     AsyncIOScheduler = None
 
-# Enable logging
+# Enable logging - console plus bot.log so failures stay inspectable
+# after the launcher window closes.
+LOG_FILE = os.getenv("RAVEN_LOG_FILE", "bot.log")
+_handlers = [logging.StreamHandler()]
+try:
+    _file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    _handlers.append(_file_handler)
+except OSError as exc:  # read-only folder, locked file, etc.
+    print(f"[!] Could not open {LOG_FILE} for logging: {exc}")
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=_handlers
 )
 logger = logging.getLogger(__name__)
 
@@ -75,6 +85,44 @@ def cleanup_temp_file(filepath):
             os.remove(filepath)
     except Exception as e:
         logger.warning(f"Failed to cleanup temp file {filepath}: {e}")
+
+# Telegram's hard limit per message
+TELEGRAM_MAX_LEN = 4096
+
+async def send_long(update: Update, text: str, parse_mode: str = None):
+    """Send `text`, splitting on line boundaries when it exceeds Telegram's limit.
+
+    Falls back to plain text if Markdown parsing fails, which happens whenever
+    raw AI output contains stray _ * [ or ` characters.
+    """
+    if not text:
+        return
+    text = str(text)
+    if len(text) <= TELEGRAM_MAX_LEN:
+        chunks = [text]
+    else:
+        chunks = []
+        remaining = text
+        while remaining:
+            if len(remaining) <= TELEGRAM_MAX_LEN:
+                chunks.append(remaining)
+                break
+            window = remaining[:TELEGRAM_MAX_LEN]
+            cut = window.rfind("\n")
+            if cut < TELEGRAM_MAX_LEN // 2:
+                cut = TELEGRAM_MAX_LEN
+            chunks.append(remaining[:cut])
+            remaining = remaining[cut:].lstrip("\n")
+
+    for chunk in chunks:
+        try:
+            await update.message.reply_text(chunk, parse_mode=parse_mode)
+        except Exception as exc:
+            logger.warning("reply failed (%s), retrying without parse_mode", exc)
+            try:
+                await update.message.reply_text(chunk)
+            except Exception as exc2:
+                logger.error("reply failed entirely: %s", exc2)
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
@@ -111,6 +159,28 @@ Welcome to RAVEN, your elite security assessment AI agent powered by TEOS82.
 **AI Assistance Commands:**
 /generate <topic> - Generate security-related content
 /scrape <text> - Analyze and extract information from text
+/ai_status - Show which AI providers are ready
+/dashboard - Unified status board (AI, trading, uptime)
+
+**Trading Commands** (paper mode by default - simulated fills):
+/balance - Wallet balances and open positions
+/positions - Open positions with P&L
+/buy <symbol> <usdt> - Buy $X of a coin (e.g. /buy BTC 100)
+/sell <symbol> <usdt> - Sell $X of a coin
+/orders [days] - Trade history
+/signal <symbol> - AI trade signal with confidence
+/report <daily|weekly|monthly> - P&L report
+/trade_mode [paper|live] - Show or change trading mode
+/emergency_stop - Disable all trading
+/resume - Re-enable trading after an emergency stop
+
+**Social & Content Commands:**
+/tweet <text> - Post to Twitter/X
+/thread <topic> - Draft a Twitter thread with AI
+/social_status - Which platforms are configured
+/social_guide <platform> - Setup steps for tiktok/youtube/instagram
+/create_content <platform> <topic> - Caption + script + hashtags
+/content_calendar <platform> [days] - AI content calendar
 
 **Phase 3 Features:**
 🎤 Voice Commands - Send voice notes for hands-free operation
@@ -119,7 +189,7 @@ Welcome to RAVEN, your elite security assessment AI agent powered by TEOS82.
 Simply send a message to chat with RAVEN naturally.
 Send a voice note for voice command processing.
     """
-    await update.message.reply_text(welcome_message, parse_mode='Markdown')
+    await send_long(update, welcome_message, parse_mode='Markdown')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command."""
@@ -165,7 +235,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 - Daily briefings require APScheduler: pip install APScheduler
 - Real breach detection requires requests library and HIBP API key
     """
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    await send_long(update, help_text, parse_mode='Markdown')
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /clear command."""
@@ -177,13 +247,13 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove("raven_session.json")
     except Exception:
         pass
-    await update.message.reply_text("🗑️ Conversation history cleared.")
+    await send_long(update, "🗑️ Conversation history cleared.")
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /history command."""
     global conversation_history
     if not conversation_history:
-        await update.message.reply_text("📝 No conversation history.")
+        await send_long(update, "📝 No conversation history.")
         return
 
     # Format history for display
@@ -196,7 +266,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(conversation_history) > 10:
         history_text += f"... and {len(conversation_history) - 10} more messages"
 
-    await update.message.reply_text(history_text, parse_mode='Markdown')
+    await send_long(update, history_text, parse_mode='Markdown')
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /model command."""
@@ -204,9 +274,9 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         new_model = context.args[0]
         current_model = new_model
-        await update.message.reply_text(f"🔄 Model changed to: {new_model}")
+        await send_long(update, f"🔄 Model changed to: {new_model}")
     else:
-        await update.message.reply_text(f"🤖 Current model: {current_model}\nUsage: /model <model_name>")
+        await send_long(update, f"🤖 Current model: {current_model}\nUsage: /model <model_name>")
 
 async def system_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /system command."""
@@ -234,7 +304,7 @@ async def system_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 **Status:** 🟢 Online and ready
     """
-    await update.message.reply_text(system_info, parse_mode='Markdown')
+    await send_long(update, system_info, parse_mode='Markdown')
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /export command."""
@@ -250,9 +320,9 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(export_data, f, indent=2, ensure_ascii=False)
 
-        await update.message.reply_text(f"💾 Conversation exported to `{filename}`", parse_mode='Markdown')
+        await send_long(update, f"💾 Conversation exported to `{filename}`", parse_mode='Markdown')
     except Exception as e:
-        await update.message.reply_text(f"❌ Export failed: {str(e)}")
+        await send_long(update, f"❌ Export failed: {str(e)}")
 
 async def tokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /tokens command."""
@@ -274,15 +344,15 @@ async def tokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 - Actual token usage depends on the specific model
 - Includes both user and AI messages
     """
-    await update.message.reply_text(tokens_info, parse_mode='Markdown')
+    await send_long(update, tokens_info, parse_mode='Markdown')
 
 async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /save command."""
     global conversation_history
     if auto_save(conversation_history):
-        await update.message.reply_text("💾 Session saved successfully.")
+        await send_long(update, "💾 Session saved successfully.")
     else:
-        await update.message.reply_text("❌ Failed to save session.")
+        await send_long(update, "❌ Failed to save session.")
 
 async def load_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /load command."""
@@ -290,18 +360,18 @@ async def load_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loaded_history = auto_load()
     if loaded_history is not None:
         conversation_history = loaded_history
-        await update.message.reply_text(f"📂 Session loaded. {len(conversation_history)} messages restored.")
+        await send_long(update, f"📂 Session loaded. {len(conversation_history)} messages restored.")
     else:
-        await update.message.reply_text("❌ Failed to load session or no saved session found.")
+        await send_long(update, "❌ Failed to load session or no saved session found.")
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /scan command."""
     if not context.args:
-        await update.message.reply_text("❌ Usage: /scan <target>\nExample: /scan 192.168.1.1")
+        await send_long(update, "❌ Usage: /scan <target>\nExample: /scan 192.168.1.1")
         return
 
     target = " ".join(context.args)
-    await update.message.reply_text(f"🔍 Starting reconnaissance on `{target}`...", parse_mode='Markdown')
+    await send_long(update, f"🔍 Starting reconnaissance on `{target}`...", parse_mode='Markdown')
 
     # Capture stdout to prevent console spam
     f = io.StringIO()
@@ -314,16 +384,16 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversation_history.append({"role": "assistant", "content": response})
     auto_save(conversation_history)
 
-    await update.message.reply_text(f"🎯 **Reconnaissance Results for {target}:**\n\n{response}", parse_mode='Markdown')
+    await send_long(update, f"🎯 **Reconnaissance Results for {target}:**\n\n{response}", parse_mode='Markdown')
 
 async def cve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /cve command."""
     if not context.args:
-        await update.message.reply_text("❌ Usage: /cve <CVE-ID>\nExample: /cve CVE-2023-1234")
+        await send_long(update, "❌ Usage: /cve <CVE-ID>\nExample: /cve CVE-2023-1234")
         return
 
     cve_id = " ".join(context.args).upper()
-    await update.message.reply_text(f"🔍 Analyzing `{cve_id}`...", parse_mode='Markdown')
+    await send_long(update, f"🔍 Analyzing `{cve_id}`...", parse_mode='Markdown')
 
     # Capture stdout to prevent console spam
     f = io.StringIO()
@@ -336,16 +406,16 @@ async def cve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversation_history.append({"role": "assistant", "content": response})
     auto_save(conversation_history)
 
-    await update.message.reply_text(f"🐛 **CVE Analysis for {cve_id}:**\n\n{response}", parse_mode='Markdown')
+    await send_long(update, f"🐛 **CVE Analysis for {cve_id}:**\n\n{response}", parse_mode='Markdown')
 
 async def exploit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /exploit command."""
     if not context.args:
-        await update.message.reply_text("❌ Usage: /exploit <type>\nExample: /exploit bufferOverflow")
+        await send_long(update, "❌ Usage: /exploit <type>\nExample: /exploit bufferOverflow")
         return
 
     vuln_type = " ".join(context.args)
-    await update.message.reply_text(f"⚡ Getting exploitation techniques for `{vuln_type}`...", parse_mode='Markdown')
+    await send_long(update, f"⚡ Getting exploitation techniques for `{vuln_type}`...", parse_mode='Markdown')
 
     # Capture stdout to prevent console spam
     f = io.StringIO()
@@ -358,16 +428,16 @@ async def exploit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversation_history.append({"role": "assistant", "content": response})
     auto_save(conversation_history)
 
-    await update.message.reply_text(f"⚡ **Exploitation Techniques for {vuln_type}:**\n\n{response}", parse_mode='Markdown')
+    await send_long(update, f"⚡ **Exploitation Techniques for {vuln_type}:**\n\n{response}", parse_mode='Markdown')
 
 async def harden_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /harden command."""
     if not context.args:
-        await update.message.reply_text("❌ Usage: /harden <system>\nExample: /harden windowsServer")
+        await send_long(update, "❌ Usage: /harden <system>\nExample: /harden windowsServer")
         return
 
     system = " ".join(context.args)
-    await update.message.reply_text(f"🛡️ Getting hardening recommendations for `{system}`...", parse_mode='Markdown')
+    await send_long(update, f"🛡️ Getting hardening recommendations for `{system}`...", parse_mode='Markdown')
 
     # Capture stdout to prevent console spam
     f = io.StringIO()
@@ -380,16 +450,16 @@ async def harden_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversation_history.append({"role": "assistant", "content": response})
     auto_save(conversation_history)
 
-    await update.message.reply_text(f"🛡️ **Hardening Recommendations for {system}:**\n\n{response}", parse_mode='Markdown')
+    await send_long(update, f"🛡️ **Hardening Recommendations for {system}:**\n\n{response}", parse_mode='Markdown')
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /analyze command - triggers full 4-phase pentest report."""
     if not context.args:
-        await update.message.reply_text("❌ Usage: /analyze <target>\nExample: /analyze 10.0.0.5")
+        await send_long(update, "❌ Usage: /analyze <target>\nExample: /analyze 10.0.0.5")
         return
 
     target = " ".join(context.args)
-    await update.message.reply_text(f"🎯 Starting full 4-phase penetration test analysis on `{target}`...\\nThis may take a moment.", parse_mode='Markdown')
+    await send_long(update, f"🎯 Starting full 4-phase penetration test analysis on `{target}`...\\nThis may take a moment.", parse_mode='Markdown')
 
     # Capture stdout to prevent console spam
     f = io.StringIO()
@@ -402,16 +472,16 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversation_history.append({"role": "assistant", "content": response})
     auto_save(conversation_history)
 
-    await update.message.reply_text(f"📋 **Full 4-Phase Penetration Test Report for {target}:**\n\n{response}", parse_mode='Markdown')
+    await send_long(update, f"📋 **Full 4-Phase Penetration Test Report for {target}:**\n\n{response}", parse_mode='Markdown')
 
 async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /generate command."""
     if not context.args:
-        await update.message.reply_text("❌ Usage: /generate <topic>\nExample: /generate sqlInjectionReport")
+        await send_long(update, "❌ Usage: /generate <topic>\nExample: /generate sqlInjectionReport")
         return
 
     topic = " ".join(context.args)
-    await update.message.reply_text(f"📝 Generating content on `{topic}`...", parse_mode='Markdown')
+    await send_long(update, f"📝 Generating content on `{topic}`...", parse_mode='Markdown')
 
     # Capture stdout to prevent console spam
     f = io.StringIO()
@@ -424,16 +494,16 @@ async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversation_history.append({"role": "assistant", "content": response})
     auto_save(conversation_history)
 
-    await update.message.reply_text(f"📄 **Generated Content on {topic}:**\n\n{response}", parse_mode='Markdown')
+    await send_long(update, f"📄 **Generated Content on {topic}:**\n\n{response}", parse_mode='Markdown')
 
 async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /scrape command."""
     if not context.args:
-        await update.message.reply_text("❌ Usage: /scrape <text>\nExample: /scrape logFileContents")
+        await send_long(update, "❌ Usage: /scrape <text>\nExample: /scrape logFileContents")
         return
 
     text = " ".join(context.args)
-    await update.message.reply_text(f"🔍 Analyzing and extracting information from provided text...", parse_mode='Markdown')
+    await send_long(update, f"🔍 Analyzing and extracting information from provided text...", parse_mode='Markdown')
 
     # Capture stdout to prevent console spam
     f = io.StringIO()
@@ -446,7 +516,7 @@ async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversation_history.append({"role": "assistant", "content": response})
     auto_save(conversation_history)
 
-    await update.message.reply_text(f"🔎 **Extracted Information:**\n\n{response}", parse_mode='Markdown')
+    await send_long(update, f"🔎 **Extracted Information:**\n\n{response}", parse_mode='Markdown')
 
 # MODULE A: REAL BREACH DATA (/leak command with HIBP API)
 
@@ -482,11 +552,11 @@ _RATE_LIMIT_RESPONSE = """⚠️ **RATE LIMIT EXCEEDED** - {target}
 async def leak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /leak command - check if email/domain appears in breach data using HIBP API."""
     if not context.args:
-        await update.message.reply_text("❌ Usage: /leak <target>\nExample: /leak user@example.com or /leak example.com")
+        await send_long(update, "❌ Usage: /leak <target>\nExample: /leak user@example.com or /leak example.com")
         return
 
     target = " ".join(context.args).strip()
-    await update.message.reply_text(f"🔍 Checking `{target}` against breach databases...", parse_mode='Markdown')
+    await send_long(update, f"🔍 Checking `{target}` against breach databases...", parse_mode='Markdown')
 
     # Capture stdout to prevent console spam
     f = io.StringIO()
@@ -682,7 +752,7 @@ Get a free API key at https://haveibeenpwned.com/API/Key and set `HIBP_API_KEY` 
     conversation_history.append({"role": "assistant", "content": response})
     auto_save(conversation_history)
 
-    await update.message.reply_text(response, parse_mode='Markdown')
+    await send_long(update, response, parse_mode='Markdown')
 
 # ==========================================
 # INTELLIGENCE MODULES (crypto / market / darkweb_intel)
@@ -690,7 +760,7 @@ Get a free API key at https://haveibeenpwned.com/API/Key and set `HIBP_API_KEY` 
 async def crypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /crypto command - get real-time crypto prices from Binance and OKX."""
     if not CCXT_AVAILABLE:
-        await update.message.reply_text(
+        await send_long(update,
             "❌ Crypto intelligence module not available.\n"
             "Please install ccxt: `pip install ccxt`",
             parse_mode='Markdown'
@@ -698,7 +768,7 @@ async def crypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not context.args:
-        await update.message.reply_text("❌ Usage: /crypto <symbol>\nExample: /crypto BTC or /crypto ETH/USDT")
+        await send_long(update, "❌ Usage: /crypto <symbol>\nExample: /crypto BTC or /crypto ETH/USDT")
         return
 
     symbol = " ".join(context.args).upper()
@@ -706,7 +776,7 @@ async def crypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if '/' not in symbol and len(symbol) <= 5:  # Assume it's a base currency like BTC
         symbol = f"{symbol}/USDT"
 
-    await update.message.reply_text(f"📊 Fetching real-time data for `{symbol}` from Binance & OKX...", parse_mode='Markdown')
+    await send_long(update, f"📊 Fetching real-time data for `{symbol}` from Binance & OKX...", parse_mode='Markdown')
 
     # Capture stdout to prevent console spam
     f = io.StringIO()
@@ -753,16 +823,16 @@ async def crypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversation_history.append({"role": "assistant", "content": response})
     auto_save(conversation_history)
 
-    await update.message.reply_text(response, parse_mode='Markdown')
+    await send_long(update, response, parse_mode='Markdown')
 
 async def market_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /market command - AI analysis of crypto market sentiment."""
     if not context.args:
-        await update.message.reply_text("❌ Usage: /market <keyword>\nExample: /market Bitcoin or /market DeFi")
+        await send_long(update, "❌ Usage: /market <keyword>\nExample: /market Bitcoin or /market DeFi")
         return
 
     keyword = " ".join(context.args)
-    await update.message.reply_text(f"📈 Analyzing market sentiment for `{keyword}`...", parse_mode='Markdown')
+    await send_long(update, f"📈 Analyzing market sentiment for `{keyword}`...", parse_mode='Markdown')
 
     # Capture stdout to prevent console spam
     f = io.StringIO()
@@ -788,16 +858,16 @@ Provide actionable insights for traders and investors. Use your elite security a
     conversation_history.append({"role": "assistant", "content": response})
     auto_save(conversation_history)
 
-    await update.message.reply_text(f"📊 **MARKET INTELLIGENCE ANALYSIS: {keyword}**\n\n{response}", parse_mode='Markdown')
+    await send_long(update, f"📊 **MARKET INTELLIGENCE ANALYSIS: {keyword}**\n\n{response}", parse_mode='Markdown')
 
 async def darkweb_intel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /darkweb_intel command - generate dark web threat intelligence report."""
     if not context.args:
-        await update.message.reply_text("❌ Usage: /darkweb_intel <topic>\nExample: /darkweb_intel ransomware gangs targeting healthcare")
+        await send_long(update, "❌ Usage: /darkweb_intel <topic>\nExample: /darkweb_intel ransomware gangs targeting healthcare")
         return
 
     topic = " ".join(context.args)
-    await update.message.reply_text(f"🕵️‍♂️ Generating dark web intelligence report on `{topic}`...", parse_mode='Markdown')
+    await send_long(update, f"🕵️‍♂️ Generating dark web intelligence report on `{topic}`...", parse_mode='Markdown')
 
     # Capture stdout to prevent console spam
     f = io.StringIO()
@@ -825,21 +895,21 @@ Structure this as a professional intelligence report suitable for security teams
     conversation_history.append({"role": "assistant", "content": response})
     auto_save(conversation_history)
 
-    await update.message.reply_text(f"🕵️‍♂️ **DARK WEB THREAT INTELLIGENCE REPORT**\n\nTopic: {topic}\n\n{response}", parse_mode='Markdown')
+    await send_long(update, f"🕵️‍♂️ **DARK WEB THREAT INTELLIGENCE REPORT**\n\nTopic: {topic}\n\n{response}", parse_mode='Markdown')
 
 # MODULE B: VOICE COMMAND SUPPORT
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle voice messages by transcribing them and processing as text commands."""
     if not SPEECH_RECOGNITION_AVAILABLE:
-        await update.message.reply_text("❌ Voice command support not available.\\nPlease install SpeechRecognition: `pip install SpeechRecognition`")
+        await send_long(update, "❌ Voice command support not available.\\nPlease install SpeechRecognition: `pip install SpeechRecognition`")
         return
     
     if not PYDUB_AVAILABLE:
-        await update.message.reply_text("❌ Audio processing support not available.\\nPlease install pydub: `pip install pydub`")
+        await send_long(update, "❌ Audio processing support not available.\\nPlease install pydub: `pip install pydub`")
         return
     
     # Show processing message
-    processing_msg = await update.message.reply_text("🎤 Processing voice note...", parse_mode='Markdown')
+    processing_msg = await send_long(update, "🎤 Processing voice note...", parse_mode='Markdown')
     
     temp_ogg_path = None
     temp_wav_path = None
@@ -897,12 +967,12 @@ async def handle_message_from_text(update: Update, context: ContextTypes.DEFAULT
     conversation_history.append({"role": "assistant", "content": response})
     auto_save(conversation_history)
 
-    await update.message.reply_text(response)
+    await send_long(update, response)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle regular text messages."""
     user_message = update.message.text
-    await update.message.reply_text("🤖 RAVEN is analyzing...", parse_mode='Markdown')
+    await send_long(update, "🤖 RAVEN is analyzing...", parse_mode='Markdown')
 
     # Capture stdout to prevent console spam
     f = io.StringIO()
@@ -914,7 +984,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversation_history.append({"role": "assistant", "content": response})
     auto_save(conversation_history)
 
-    await update.message.reply_text(response)
+    await send_long(update, response)
 
 # MODULE C: AUTOMATED DAILY INTELLIGENCE BRIEFINGS
 async def send_daily_briefing(bot):
@@ -1063,6 +1133,438 @@ def setup_scheduler(application):
         logger.error(f"Failed to setup scheduler: {e}")
         return None
 
+# ══════════════════════════════════════════════════════════════════════
+#  TRADING  ·  SOCIAL  ·  CONTENT  ·  ANALYTICS  COMMAND LAYER
+#  Wired to: trading_engine.py, multi_provider_ai.py,
+#            social_media_manager.py, content_creator.py, analytics.py
+# ══════════════════════════════════════════════════════════════════════
+
+import analytics as raven_analytics
+import content_creator
+import social_media_manager
+from multi_provider_ai import ROUTER, RAVEN_SYSTEM_PROMPT
+from trading_engine import TradingEngine
+
+# Shared engine instance (paper mode by default - see .env TRADING_MODE)
+TRADING = TradingEngine()
+
+# Emergency kill switch - flipped by /emergency_stop, blocks all trades
+KILL_SWITCH = False
+
+# Bot start time for uptime reporting
+START_TIME = time.time()
+
+# Simple per-user rate limiting: {user_id: [timestamps]}
+RATE_LIMITS = {}
+RATE_LIMIT_COUNT = int(os.getenv("RATE_LIMIT_COUNT", "10"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
+
+
+def is_admin(user_id: int) -> bool:
+    """Return True if the user is the configured admin.
+
+    If ADMIN_USER_ID is unset the bot is open (single-user local setup);
+    a warning is logged once so the owner knows the gate is disabled.
+    """
+    admin_id = os.getenv("ADMIN_USER_ID", "").strip()
+    if not admin_id:
+        logger.warning("ADMIN_USER_ID not set - privileged commands are open to all users")
+        return True
+    return str(user_id) == admin_id
+
+
+def rate_limited(user_id: int) -> bool:
+    """Return True when the user exceeded RATE_LIMIT_COUNT in the window."""
+    now = time.time()
+    hits = [t for t in RATE_LIMITS.get(user_id, []) if now - t < RATE_LIMIT_WINDOW]
+    hits.append(now)
+    RATE_LIMITS[user_id] = hits
+    return len(hits) > RATE_LIMIT_COUNT
+
+
+def ai_reply(prompt: str, max_tokens: int = 400) -> str:
+    """Run `prompt` through the multi-provider router and return the text.
+
+    Uses RAVEN's system prompt so replies match the bot's persona. Raises
+    RuntimeError if every configured provider fails.
+    """
+    messages = [
+        {"role": "system", "content": RAVEN_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    text, _provider = ROUTER.chat(messages, max_tokens=max_tokens)
+    return text
+
+
+def portfolio_text(snapshot: dict) -> str:
+    """Render a portfolio snapshot as a Telegram-friendly block."""
+    mode = snapshot.get("mode", "paper").upper()
+    lines = [
+        f"PORTFOLIO ({mode} MODE)",
+        "-" * 34,
+        f"Cash        ${snapshot['cash']:>12,.2f}",
+        f"Positions   ${snapshot['positions_value']:>12,.2f}",
+        f"Equity      ${snapshot['equity']:>12,.2f}",
+        f"Unrealized  ${snapshot['unrealized_pnl']:>+12,.2f}",
+    ]
+    rows = snapshot.get("positions") or []
+    if rows:
+        lines.append("-" * 34)
+        for row in rows:
+            lines.append(
+                f"{row['symbol']:<12} {row['qty']:.6f} @ {row['avg_price']:,.2f}"
+                f"  now {row['price']:,.2f}  {row['pnl_pct']:+.2f}%"
+            )
+    else:
+        lines.append("-" * 34)
+        lines.append("No open positions.")
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /balance - show wallet balances and open positions."""
+    if rate_limited(update.effective_user.id):
+        await send_long(update, "⏱️ Rate limit reached. Try again in a minute.")
+        return
+    try:
+        snapshot = TRADING.portfolio_snapshot()
+    except Exception as exc:
+        logger.error("portfolio_snapshot failed: %s", exc)
+        await send_long(update, f"❌ Could not fetch prices: {exc}")
+        return
+    await send_long(update, portfolio_text(snapshot))
+
+
+async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /positions - list open positions only."""
+    try:
+        snapshot = TRADING.portfolio_snapshot()
+    except Exception as exc:
+        await send_long(update, f"❌ Could not fetch prices: {exc}")
+        return
+    rows = snapshot.get("positions") or []
+    if not rows:
+        await send_long(update, "📭 No open positions.")
+        return
+    lines = ["OPEN POSITIONS", "-" * 34]
+    for row in rows:
+        lines.append(
+            f"{row['symbol']:<12} qty {row['qty']:.6f}\n"
+            f"  avg {row['avg_price']:,.2f} | now {row['price']:,.2f} | "
+            f"value ${row['value']:,.2f} | P&L {row['pnl_pct']:+.2f}%"
+        )
+    await send_long(update, "```\n" + "\n".join(lines) + "\n```")
+
+
+async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE, side: str):
+    """Shared implementation for /buy and /sell.
+
+    Amounts are notional in USDT: /buy BTC 100 buys $100 of BTC.
+    """
+    if not is_admin(update.effective_user.id):
+        await send_long(update, "⛔ Admin only.")
+        return
+    if KILL_SWITCH:
+        await send_long(update, "🛑 Emergency stop is active. Use /resume to re-enable trading.")
+        return
+    if rate_limited(update.effective_user.id):
+        await send_long(update, "⏱️ Rate limit reached. Try again in a minute.")
+        return
+
+    args = context.args
+    if len(args) < 2:
+        await send_long(
+            update,
+            f"❌ Usage: /{side} <symbol> <amount_usdt>\n"
+            f"Example: /{side} BTC 100",
+        )
+        return
+
+    symbol = TRADING.normalize_symbol(args[0])
+    try:
+        amount = float(args[1])
+    except ValueError:
+        await send_long(update, "❌ Amount must be a number, e.g. /buy BTC 100")
+        return
+
+    ok, reason = TRADING.check_risk(side, symbol, amount)
+    if not ok:
+        await send_long(update, f"🚫 Blocked: {reason}")
+        return
+
+    await send_long(update, f"⏳ Executing {side.upper()} {symbol} ${amount:,.2f}...")
+    try:
+        receipt = TRADING.execute(side, symbol, amount, update.effective_user.id)
+    except Exception as exc:
+        logger.exception("trade execution failed")
+        await send_long(update, f"❌ Order failed: {exc}")
+        return
+
+    tag = "LIVE" if receipt["mode"] == "live" else "PAPER"
+    await send_long(
+        update,
+        f"✅ [{tag}] {side.upper()} {receipt['symbol']}\n"
+        f"   ${receipt['amount_usdt']:,.2f} @ {receipt['price']:,.2f}\n"
+        f"   qty {receipt['qty']:.6f} · {receipt['ts']}",
+    )
+
+
+async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /buy <symbol> <amount_usdt>."""
+    await trade_command(update, context, "buy")
+
+
+async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /sell <symbol> <amount_usdt>."""
+    await trade_command(update, context, "sell")
+
+
+async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /orders - recent trade history and open orders."""
+    days = 7
+    if context.args:
+        try:
+            days = max(1, min(90, int(context.args[0])))
+        except ValueError:
+            pass
+    trades = TRADING.trades_report(days)
+    if not trades:
+        await send_long(update, f"📭 No trades in the last {days} day(s).")
+        return
+    lines = [f"TRADE HISTORY (last {days}d)", "-" * 40]
+    for trade in trades[-20:]:
+        lines.append(
+            f"{trade['date']} {trade['side'].upper():<4} "
+            f"{trade['symbol']:<12} ${trade['amount_usdt']:>9,.2f} @ {trade['price']:>10,.2f}"
+            + (f"  P&L {trade['pnl']:+,.2f}" if trade["side"] == "sell" else "")
+        )
+    if len(trades) > 20:
+        lines.append(f"... {len(trades) - 20} older trades omitted")
+    await send_long(update, "```\n" + "\n".join(lines) + "\n```")
+
+
+async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /signal <symbol> - AI-generated trade signal."""
+    if not context.args:
+        await send_long(update, "❌ Usage: /signal <symbol>\nExample: /signal BTC")
+        return
+    if rate_limited(update.effective_user.id):
+        await send_long(update, "⏱️ Rate limit reached. Try again in a minute.")
+        return
+    symbol = TRADING.normalize_symbol(context.args[0])
+    try:
+        price = TRADING.get_price(symbol)
+    except Exception as exc:
+        await send_long(update, f"❌ Could not fetch price for {symbol}: {exc}")
+        return
+
+    await send_long(update, f"🧠 Generating signal for {symbol} @ {price:,.2f}...")
+    prompt = (
+        f"Give a trading signal for {symbol} currently at {price}.\n"
+        "Reply in exactly this format:\n"
+        "BIAS: BUY | SELL | HOLD\n"
+        "CONFIDENCE: <0-100>%\n"
+        "ENTRY: <price zone>\n"
+        "STOP-LOSS: <price>\n"
+        "TAKE-PROFIT: <price>\n"
+        "RATIONALE: <one sentence>"
+    )
+    try:
+        text = ai_reply(prompt, max_tokens=300)
+    except Exception as exc:
+        logger.exception("signal generation failed")
+        await send_long(update, f"❌ AI unavailable: {exc}")
+        return
+    await send_long(update, f"📊 SIGNAL · {symbol} @ {price:,.2f}\n\n{text}")
+
+
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /report <daily|weekly|monthly> - P&L report."""
+    period = (context.args[0].lower() if context.args else "daily")
+    if period not in ("daily", "weekly", "monthly"):
+        await send_long(update, "❌ Usage: /report <daily|weekly|monthly>")
+        return
+    await send_long(update, raven_analytics.trading_report(period))
+
+
+async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /dashboard - unified status board."""
+    await send_long(
+        update,
+        raven_analytics.system_stats(
+            time.time() - START_TIME, router=ROUTER, engine=TRADING
+        ),
+    )
+
+
+async def ai_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /ai_status - show which AI providers are ready."""
+    status = ROUTER.providers_status()
+    lines = ["AI PROVIDER STATUS", "-" * 30]
+    for name, ready in status.items():
+        lines.append(f"{'READY ' if ready else 'OFF   '} {name}")
+    lines.append("-" * 30)
+    lines.append(f"Priority: {' > '.join(ROUTER.priority)}")
+    lines.append(f"Model:    {ROUTER.model}")
+    await send_long(update, "```\n" + "\n".join(lines) + "\n```")
+
+
+async def emergency_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /emergency_stop - disable all trading."""
+    global KILL_SWITCH
+    if not is_admin(update.effective_user.id):
+        await send_long(update, "⛔ Admin only.")
+        return
+    KILL_SWITCH = True
+    logger.warning("EMERGENCY STOP activated by %s", update.effective_user.id)
+    await send_long(update, "🛑 EMERGENCY STOP\nAll trading is disabled.\nUse /resume to re-enable.")
+
+
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /resume - re-enable trading after an emergency stop."""
+    global KILL_SWITCH
+    if not is_admin(update.effective_user.id):
+        await send_long(update, "⛔ Admin only.")
+        return
+    KILL_SWITCH = False
+    logger.warning("Trading resumed by %s", update.effective_user.id)
+    await send_long(update, "▶️ Trading re-enabled.")
+
+
+async def trade_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /trade_mode [paper|live] - show or change the trading mode."""
+    global TRADING
+    if not is_admin(update.effective_user.id):
+        await send_long(update, "⛔ Admin only.")
+        return
+    if not context.args:
+        await send_long(
+            update,
+            f"Current mode: {TRADING.mode.upper()}\n"
+            "⚠️  /trade_mode live places REAL orders and needs exchange keys\n"
+            "    with TRADE-only permission (no withdrawal).",
+        )
+        return
+    mode = context.args[0].lower()
+    if mode not in ("paper", "live"):
+        await send_long(update, "❌ Usage: /trade_mode <paper|live>")
+        return
+    if mode == "live":
+        if not is_admin(update.effective_user.id):
+            await send_long(update, "⛔ Admin only.")
+            return
+        TRADING.mode = "live"
+        logger.warning("TRADING MODE SET TO LIVE by %s", update.effective_user.id)
+        await send_long(update, "🔴 LIVE MODE ENABLED - real orders will be placed.")
+    else:
+        TRADING.mode = "paper"
+        logger.warning("TRADING MODE SET TO PAPER by %s", update.effective_user.id)
+        await send_long(update, "🟢 PAPER MODE - simulated fills only.")
+
+
+async def tweet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /tweet <text> - post to Twitter/X."""
+    if not context.args:
+        await send_long(update, "❌ Usage: /tweet <text>")
+        return
+    if rate_limited(update.effective_user.id):
+        await send_long(update, "⏱️ Rate limit reached. Try again in a minute.")
+        return
+    ok, message = social_media_manager.post_tweet(" ".join(context.args))
+    await send_long(update, message)
+
+
+async def thread_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /thread <text> - draft a Twitter thread with the AI."""
+    if not context.args:
+        await send_long(update, "❌ Usage: /thread <topic or first post>")
+        return
+    if rate_limited(update.effective_user.id):
+        await send_long(update, "⏱️ Rate limit reached. Try again in a minute.")
+        return
+    await send_long(update, "🧵 Drafting thread...")
+    prompt = (
+        f"Write a Twitter/X thread about: {' '.join(context.args)}\n"
+        "Number each post as '1/6', '2/6' etc. Max 270 characters per post. "
+        "End with a call to action. No hashtags in the middle posts."
+    )
+    try:
+        text = ai_reply(prompt, max_tokens=700)
+    except Exception as exc:
+        logger.exception("thread generation failed")
+        await send_long(update, f"❌ AI unavailable: {exc}")
+        return
+    await send_long(update, f"🧵 THREAD DRAFT\n\n{text}")
+
+
+async def social_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /social_status - which platforms have credentials configured."""
+    status = social_media_manager.status()
+    lines = ["SOCIAL PLATFORM STATUS", "-" * 30]
+    for name, ready in status.items():
+        lines.append(f"{'READY ' if ready else 'SETUP '} {name}")
+    lines.append("-" * 30)
+    lines.append("Only Twitter/X can post directly from the bot.")
+    lines.append("TikTok/YouTube/Instagram need developer apps:")
+    lines.append("/social_guide tiktok|youtube|instagram")
+    await send_long(update, "```\n" + "\n".join(lines) + "\n```")
+
+
+async def social_guide_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /social_guide <platform> - show the setup steps for a platform."""
+    platform = context.args[0] if context.args else "tiktok"
+    await send_long(update, social_media_manager.platform_guide(platform))
+
+
+async def create_content_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /create_content <platform> <topic> - full content package."""
+    if len(context.args) < 2:
+        await send_long(
+            update,
+            "❌ Usage: /create_content <platform> <topic>\n"
+            "Platforms: tiktok, twitter, youtube, instagram",
+        )
+        return
+    if rate_limited(update.effective_user.id):
+        await send_long(update, "⏱️ Rate limit reached. Try again in a minute.")
+        return
+    platform = context.args[0].lower()
+    topic = " ".join(context.args[1:])
+    await send_long(update, f"🎬 Generating {platform} content package for: {topic}")
+    try:
+        package = content_creator.content_package(platform, topic)
+    except Exception as exc:
+        logger.exception("content generation failed")
+        await send_long(update, f"❌ AI unavailable: {exc}")
+        return
+    await send_long(update, f"CONTENT PACKAGE · {platform.upper()}\n\n{package}")
+
+
+async def content_calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /content_calendar <platform> [days] - AI content calendar."""
+    if not context.args:
+        await send_long(update, "❌ Usage: /content_calendar <platform> [days]")
+        return
+    platform = context.args[0].lower()
+    days = 7
+    if len(context.args) > 1:
+        try:
+            days = max(1, min(30, int(context.args[1])))
+        except ValueError:
+            pass
+    if rate_limited(update.effective_user.id):
+        await send_long(update, "⏱️ Rate limit reached. Try again in a minute.")
+        return
+    await send_long(update, f"📅 Building a {days}-day {platform} calendar...")
+    try:
+        text = content_creator.content_calendar(platform, days)
+    except Exception as exc:
+        logger.exception("content calendar failed")
+        await send_long(update, f"❌ AI unavailable: {exc}")
+        return
+    await send_long(update, f"CONTENT CALENDAR · {platform.upper()}\n\n{text}")
+
+
 async def post_init(application):
     """Runs inside the event loop once the bot is initialized - safe place to start the scheduler."""
     setup_scheduler(application)
@@ -1123,6 +1625,30 @@ def main():
     # AI assistance handlers
     application.add_handler(CommandHandler("generate", generate_command))
     application.add_handler(CommandHandler("scrape", scrape_command))
+
+    # Trading handlers (paper mode by default, admin-gated)
+    application.add_handler(CommandHandler("balance", balance_command))
+    application.add_handler(CommandHandler("positions", positions_command))
+    application.add_handler(CommandHandler("buy", buy_command))
+    application.add_handler(CommandHandler("sell", sell_command))
+    application.add_handler(CommandHandler("orders", orders_command))
+    application.add_handler(CommandHandler("signal", signal_command))
+    application.add_handler(CommandHandler("report", report_command))
+    application.add_handler(CommandHandler("trade_mode", trade_mode_command))
+    application.add_handler(CommandHandler("emergency_stop", emergency_stop_command))
+    application.add_handler(CommandHandler("resume", resume_command))
+
+    # Analytics + AI provider status
+    application.add_handler(CommandHandler("dashboard", dashboard_command))
+    application.add_handler(CommandHandler("ai_status", ai_status_command))
+
+    # Social media + content creation
+    application.add_handler(CommandHandler("tweet", tweet_command))
+    application.add_handler(CommandHandler("thread", thread_command))
+    application.add_handler(CommandHandler("social_status", social_status_command))
+    application.add_handler(CommandHandler("social_guide", social_guide_command))
+    application.add_handler(CommandHandler("create_content", create_content_command))
+    application.add_handler(CommandHandler("content_calendar", content_calendar_command))
 
     # Voice message handler
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
