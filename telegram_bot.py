@@ -1433,7 +1433,7 @@ async def my_usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user is None:
         return
-    summary = await saas.usage_summary(user.id)
+    summary = await saas.usage_summary(user.id, is_admin=is_admin(user.id))
     history = await database.ahistory(user.id, limit=3)
     text = saas.render_usage(summary)
     if history:

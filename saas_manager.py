@@ -172,8 +172,13 @@ def requires(action: str):
     return decorator
 
 
-async def usage_summary(telegram_id: str) -> Dict[str, Any]:
-    """Everything /my_usage needs in a single call."""
+async def usage_summary(telegram_id: str, is_admin: bool = False) -> Dict[str, Any]:
+    """Everything /my_usage needs in a single call.
+
+    `is_admin` affects display only: quotas are bypassed for the owner at check
+    time, so without it the panel would claim "Free tier, 0 media left" to
+    someone who in fact has unrestricted access.
+    """
     user = await database.aget_user(str(telegram_id))
     tier = user.get("tier", database.TIER_FREE)
     cfg = tier_config(tier)
@@ -197,6 +202,7 @@ async def usage_summary(telegram_id: str) -> Dict[str, Any]:
         "media_limit": cfg["daily_media"],
         "media_remaining": remaining(cfg["daily_media"], "daily_media"),
         "storage": "sqlite" if database.db_available() else "memory",
+        "is_admin": bool(is_admin),
     }
 
 
@@ -213,9 +219,31 @@ def render_usage(summary: Dict[str, Any]) -> str:
         database.TIER_PRO: "\U0001F535",
         database.TIER_ENTERPRISE: "\U0001F4E6",
     }
-    icon = icons.get(summary["tier"], "\u26AA")
     who = summary.get("username") or summary["telegram_id"]
 
+    # The owner is not on a tier at all. Show what is actually true instead of a
+    # free-tier panel full of zeroes, which reads as "broken" or "locked".
+    if summary.get("is_admin"):
+        used = summary["used"]
+        return "\n".join([
+            "\U0001F451 MY USAGE - OWNER (ADMIN)",
+            "-" * 34,
+            f"  User     @{who}",
+            "  Access   all features, no daily quota",
+            f"  Storage  {summary['storage']}",
+            f"  Stored tier: {summary['tier_label']} (not applied to you)",
+            "",
+            "TODAY - counted for reference, never enforced",
+            line("Scans", used.get("daily_scans", 0), UNLIMITED, None),
+            line("Media", used.get("daily_media", 0), UNLIMITED, None),
+            "",
+            "FEATURES - all unlocked",
+            "  [yes] Text chat        [yes] Security scans",
+            "  [yes] Image analysis   [yes] Document analysis",
+            "  [yes] Video analysis",
+        ])
+
+    icon = icons.get(summary["tier"], "\u26AA")
     lines = [
         f"{icon} MY USAGE - {summary['tier_label'].upper()} TIER",
         "-" * 34,
