@@ -238,7 +238,7 @@ def _chunk(text: str, size: int = CHUNK_CHARS) -> List[str]:
     return chunks
 
 
-def _to_opus(mp3_path: str, ogg_path: str) -> bool:
+async def _to_opus(mp3_path: str, ogg_path: str) -> bool:
     """Transcode to the only format Telegram accepts for voice notes."""
     if not FFMPEG:
         _fail("ffmpeg is not installed, so I cannot produce Telegram's "
@@ -253,7 +253,10 @@ def _to_opus(mp3_path: str, ogg_path: str) -> bool:
         ogg_path,
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, timeout=180)
+        # Run the blocking subprocess call in a thread to avoid blocking the event loop
+        res = await asyncio.to_thread(
+            lambda: subprocess.run(cmd, capture_output=True, timeout=180)
+        )
     except subprocess.TimeoutExpired:
         _fail("Audio conversion timed out.")
     if res.returncode != 0 or not os.path.exists(ogg_path):
@@ -262,7 +265,7 @@ def _to_opus(mp3_path: str, ogg_path: str) -> bool:
     return True
 
 
-def _duration(path: str) -> int:
+async def _duration(path: str) -> int:
     """Seconds of audio, for Telegram's duration field. Best effort."""
     if not FFPROBE:
         # ~32kbps mono opus; good enough for a display field.
@@ -271,10 +274,13 @@ def _duration(path: str) -> int:
         except OSError:
             return 0
     try:
-        res = subprocess.run(
-            [FFPROBE, "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, timeout=60)
+        # Run the blocking subprocess call in a thread to avoid blocking the event loop
+        res = await asyncio.to_thread(
+            lambda: subprocess.run(
+                [FFPROBE, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, timeout=60)
+        )
         return int(float(res.stdout.decode().strip()))
     except Exception:
         return 0
@@ -335,12 +341,12 @@ async def speak(text: str, lang: str = DEFAULT_LANG,
         if not os.path.exists(mp3_path) or os.path.getsize(mp3_path) == 0:
             _fail("The speech service returned no audio.")
 
-        await asyncio.to_thread(_to_opus, mp3_path, ogg_path)
+        await _to_opus(mp3_path, ogg_path)
         return {
             "path": ogg_path,
             # ffprobe is a subprocess; spawning it inline would block the event
             # loop for the length of the call.
-            "duration": await asyncio.to_thread(_duration, ogg_path),
+            "duration": await _duration(ogg_path),
             "voice": chosen,
             "chars": len(body),
         }

@@ -47,3 +47,17 @@ langdetect>=1.0.9
 # format Telegram requires using the `ffmpeg` binary, the same one video
 # keyframe extraction already uses.
 edge-tts>=6.1
+jinja2
+
+# Async SQLAlchemy stack. database.py drives the engine through
+# create_async_engine() and defaults SQLite to the sqlite+aiosqlite dialect,
+# so both aiosqlite and greenlet are hard requirements, not optional extras.
+# Without them init_db() fails on a clean install.
+aiosqlite
+greenlet
+
+# aiohttp is used by webhook_server.py to keep the Telegram notification
+# connection warm between upgrade events. Imported lazily inside
+# _get_telegram_session(), so the webhook still boots without it, but install
+# it to get the reuse.
+aiohttp

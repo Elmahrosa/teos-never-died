@@ -14,9 +14,11 @@ raised and callers can show a friendly error.
 Security note: keys are read from environment only, never logged.
 """
 
+import asyncio
 import os
 import logging
 import requests
+from typing import Dict, Optional
 
 logger = logging.getLogger("raven.ai")
 
@@ -36,6 +38,16 @@ CLOUD_TIMEOUT = float(os.getenv("CLOUD_AI_TIMEOUT", "45"))
 # token. Keeping the model resident for 30m removes that delay from every routed
 # command as well as normal chat. Blank RAVEN_KEEP_ALIVE to use Ollama's default.
 KEEP_ALIVE = os.getenv("RAVEN_KEEP_ALIVE", "30m").strip()
+
+# Cloud providers are called from AIRouter.chat(), which runs in a worker
+# thread via asyncio.to_thread(). A previous attempt cached aiohttp sessions
+# to reuse connections, but an aiohttp ClientSession is bound to the event
+# loop that created it, and chat() drives a fresh loop per call via
+# asyncio.run(). The cached session was therefore always dead on reuse, so the
+# "optimisation" was strictly worse than a plain blocking request. requests
+# keeps its own per-thread connection pool, which is what actually gives us
+# connection reuse here.
+
 
 # ----------------------------------------------------------------------
 # System prompt (used for every bot conversation)
@@ -82,11 +94,14 @@ def _key(name: str) -> str:
     return ""
 
 
-def ollama_status(host: str = None) -> bool:
+async def ollama_status(host: str = None) -> bool:
     """Return True if the Ollama daemon responds."""
     host = host or os.getenv("OLLAMA_HOST", OLLAMA_HOST_DEFAULT)
     try:
-        requests.get(f"{host}/api/tags", timeout=3)
+        # Run the blocking HTTP request in a thread to avoid blocking the event loop
+        response = await asyncio.to_thread(
+            lambda: requests.get(f"{host}/api/tags", timeout=3)
+        )
         return True
     except Exception:
         return False
@@ -111,12 +126,12 @@ class AIRouter:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def providers_status(self) -> dict:
+    async def providers_status(self) -> dict:
         """Return a {name: ready_bool} map for the dashboard/status pages."""
         status = {}
         for name in self.priority:
             if name == "ollama":
-                status[name] = ollama_status(self.ollama_host)
+                status[name] = await ollama_status(self.ollama_host)
             elif name == "openai":
                 status[name] = bool(_key("OPENAI_API_KEY"))
             elif name == "anthropic":

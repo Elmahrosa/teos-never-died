@@ -223,7 +223,7 @@ async def usage_summary(telegram_id: str, is_admin: bool = False) -> Dict[str, A
         "scans_remaining": remaining(cfg["daily_scans"], "daily_scans"),
         "media_limit": cfg["daily_media"],
         "media_remaining": remaining(cfg["daily_media"], "daily_media"),
-        "storage": "sqlite" if database.db_available() else "memory",
+        "storage": "sqlite" if await database.db_available() else "memory",
         "is_admin": bool(is_admin),
     }
 

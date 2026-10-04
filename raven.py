@@ -208,7 +208,12 @@ def now_str():
 
 
 def get_reply(model, messages, stream=False):
-    """Send `messages` to the local Ollama model and return the reply text."""
+    """Send `messages` to the local Ollama model and return the reply text.
+
+    Errors propagate. Callers decide how to report them, and nothing
+    downstream mistakes an error string for a real model reply - which would
+    then be persisted into the session file and the knowledge base.
+    """
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -234,6 +239,7 @@ def get_reply(model, messages, stream=False):
         except Exception as e:
             last_err = e
             err = str(e).lower()
+            # A missing model will not fix itself on a retry, so surface it now.
             if "not found" in err or "model" in err:
                 raise
             if attempt < MAX_RETRIES:
@@ -513,26 +519,26 @@ def cmd_learn(messages, model):
     if len(active_msgs) < 2:
         print("[!] Not enough conversation to learn from")
         return
-        
+
     print("[+] Learning from recent session...")
     insights = []
-    
+
     for i in range(0, len(active_msgs)-1, 2):
         if i+1 < len(active_msgs):
             user_msg = active_msgs[i]
             assistant_msg = active_msgs[i+1]
-            
+
             if user_msg.get("role") == "user" and assistant_msg.get("role") == "assistant":
                 user_content = user_msg.get("content", "").lower()
                 assistant_content = assistant_msg.get("content", "")
-                
-                trigger_words = ["technique", "method", "tool", "command", "script", 
+
+                trigger_words = ["technique", "method", "tool", "command", "script",
                                "vulnerability", "exploit", "bypass", "payload"]
-                
+
                 if any(word in user_content for word in trigger_words) and len(assistant_content) > 50:
                     insight_title = f"Insight from session: {user_msg['content'][:30]}..."
                     insight_content = f"User asked: {user_msg['content']}\n\nRAVEN responded:\n{assistant_content[:500]}{'...' if len(assistant_content) > 500 else ''}"
-                    
+
                     category = "general"
                     if any(word in assistant_content.lower() for word in ["network", "port", "scan", "recon"]):
                         category = "reconnaissance"
@@ -546,23 +552,23 @@ def cmd_learn(messages, model):
                         category = "exfiltration"
                     elif any(word in assistant_content.lower() for word in ["phishing", "social", "email"]):
                         category = "social_engineering"
-                    
+
                     insights.append((insight_title, insight_content, category))
-    
+
     if not insights:
         print("[!] No clear insights detected in recent session")
         print("[*] Try using /addknowledge to manually add valuable information")
         return
-        
+
     print(f"[+] Detected {len(insights)} potential insight(s):")
     for i, (title, content, category) in enumerate(insights, 1):
         print(f"    {i}. [{category}] {title}")
-    
+
     proceed = input("\n[+] Add these insights to knowledge base? (y/N): ").strip().lower()
     if proceed != 'y':
         print("[*] Learning cancelled")
         return
-        
+
     added = 0
     for title, content, category in insights:
         success, msg = add_knowledge(title, content, category)
@@ -571,8 +577,155 @@ def cmd_learn(messages, model):
             added += 1
         else:
             print(f"    [!] {msg}")
-    
+
     print(f"[+] Learning complete. Added {added} insight(s) to knowledge base.")
+
+
+def cmd_autorecon(messages, model):
+    """Perform automated reconnaissance on explicitly authorized targets only.
+
+    Targets are gated by recon_engine.validate_target(), which uses a strict
+    allowlist. Nothing here widens that allowlist.
+    """
+    # Import the recon engine
+    try:
+        sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+        from recon_engine import ReconEngine, SafetyError
+    except ImportError as e:
+        print(f"[!] Failed to load reconnaissance engine: {e}")
+        return None
+
+    # Get target from user
+    print("[+] Automated Reconnaissance - authorized targets only")
+    print("    Allowed: RFC1918/loopback addresses, plus any host listed in")
+    print("    RAVEN_PRE_APPROVED_DOMAINS. Link-local metadata, unspecified and")
+    print("    reserved ranges are refused.")
+    target = input("    Enter target IP/hostname: ").strip()
+
+    if not target:
+        print("[!] Target is required")
+        return None
+
+    # Initialize engine
+    engine = ReconEngine()
+
+    # Validate target
+    try:
+        validated_target = engine.validate_target(target)
+        print(f"[+] Target validated: {validated_target}")
+    except SafetyError as e:
+        print(f"[!] {e}")
+        return None
+
+    print("[*] Running safe reconnaissance checks...")
+
+    # Run reconnaissance checks
+    async def run_checks():
+        results = {}
+
+        # 1. Ping test
+        print("    [*] Testing connectivity...")
+        results["ping"] = await engine.ping_host(validated_target, count=2)
+
+        # 2. Port scan (common ports)
+        print("    [*] Scanning common ports...")
+        common_ports = [21, 22, 23, 25, 53, 80, 110, 143, 443, 993, 995, 8080, 8443]
+        results["port_scan"] = await engine.port_scan(validated_target, common_ports, timeout=2)
+
+        # 3. HTTP header fetch (if web ports open)
+        web_ports = [80, 443, 8080, 8443]
+        open_web_ports = [p for p in web_ports if p in results["port_scan"].get("open_ports", [])]
+
+        if open_web_ports:
+            print(f"    [*] Fetching HTTP headers from ports {open_web_ports}...")
+            http_results = []
+            for port in open_web_ports[:2]:  # Limit to first 2 web ports
+                use_ssl = port in [443, 8443]
+                header_result = await engine.fetch_http_headers(validated_target, port, use_ssl)
+                http_results.append({"port": port, "ssl": use_ssl, "result": header_result})
+            results["http_headers"] = http_results
+        else:
+            results["http_headers"] = [{"error": "No web ports open"}]
+
+        return results
+
+    # Run the async checks
+    try:
+        if sys.platform == "win32":
+            # Windows-specific asyncio setup
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+        results = asyncio.run(run_checks())
+
+        # Display results
+        print("\n[+] Reconnaissance Results:")
+        print(f"    Target: {validated_target}")
+
+        # Ping results
+        ping_result = results.get("ping", {})
+        if ping_result.get("status") == "completed":
+            print("    [*] Connectivity: Host is reachable")
+        else:
+            print("    [*] Connectivity: Host appears unreachable or blocked")
+
+        # Port scan results
+        port_scan = results.get("port_scan", {})
+        open_ports = port_scan.get("open_ports", [])
+        if open_ports:
+            print(f"    [*] Open Ports: {', '.join(map(str, open_ports))}")
+        else:
+            print("    [*] Open Ports: None detected")
+
+        # HTTP results
+        http_results = results.get("http_headers", [])
+        for http_result in http_results:
+            port = http_result.get("port", "unknown")
+            if "error" not in http_result.get("result", {}):
+                print(f"    [*] HTTP/{'HTTPS' if http_result.get('ssl') else 'HTTP'} on port {port}: Headers retrieved")
+            else:
+                print(f"    [*] HTTP/{'HTTPS' if http_result.get('ssl') else 'HTTP'} on port {port}: Failed ({http_result['result'].get('error', 'unknown error')})")
+
+        # Prepare data for AI analysis
+        print("\n[+] Generating security assessment...")
+
+        # Format results for AI prompt
+        assessment_data = f"""
+RECONNAISSANCE DATA FOR TARGET: {validated_target}
+
+CONNECTIVITY:
+- Ping: {'Success' if ping_result.get('status') == 'completed' else 'Failed'}
+
+PORT SCAN:
+- Open Ports: {', '.join(map(str, open_ports)) if open_ports else 'None'}
+- Scanned Ports: {', '.join(map(str, port_scan.get('scanned_ports', [])))}
+
+WEB SERVICE CHECKS:
+"""
+        for http_result in http_results:
+            port = http_result.get("port")
+            result = http_result.get("result", {})
+            if "error" not in result:
+                assessment_data += f"- Port {port} ({'HTTPS' if http_result.get('ssl') else 'HTTP'}): Accessible, headers retrieved\n"
+            else:
+                assessment_data += f"- Port {port} ({'HTTPS' if http_result.get('ssl') else 'HTTP'}): {result.get('error', 'Failed')}\n"
+
+        assessment_data += """
+IMPORTANT: This is authorized local testing only. Provide a professional 4-phase Red Team assessment based on this data.
+"""
+
+        # Add to messages and get AI response
+        messages.append({"role": "user", "content": assessment_data})
+        reply = get_reply(model, messages, stream=False)
+        messages.append({"role": "assistant", "content": reply})
+
+        print("\n[+] RAVEN Assessment:")
+        print(reply)
+
+    except Exception as e:
+        print(f"[!] Reconnaissance error: {e}")
+        return None
+
+    return None
 
 
 COMMANDS = {
@@ -593,6 +746,7 @@ COMMANDS = {
     "/listcategories":  ("List knowledge categories",               cmd_listcategories),
     "/stats":           ("Show knowledge base statistics",          cmd_stats),
     "/learn":           ("Extract insights from session",           cmd_learn),
+    "/autorecon":       ("Automated reconnaissance (local only)",   cmd_autorecon),
 }
 
 

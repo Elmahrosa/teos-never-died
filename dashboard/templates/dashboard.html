@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }}</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>{{ title }}</h1>
+            <div class="timestamp">Last updated: {{ timestamp }}</div>
+            <p class="note">Token-protected &mdash; requires <code>DASHBOARD_TOKEN</code>. Monitoring only.</p>
+        </header>
+
+        <section class="stats-grid">
+            <!-- User Stats -->
+            <div class="stat-card">
+                <h2>User Statistics</h2>
+                <p><strong>Total Users:</strong> {{ user_stats.total_users }}</p>
+                {% if user_stats.by_tier %}
+                <p><strong>Breakdown by Tier:</strong></p>
+                <ul>
+                    {% for tier, count in user_stats.by_tier.items() %}
+                    <li>{{ tier|capitalize }}: {{ count }}</li>
+                    {% endfor %}
+                </ul>
+                {% else %}
+                <p>No tier data available.</p>
+                {% endif %}
+                {% if user_stats.error %}
+                <p class="error">Error fetching user stats: {{ user_stats.error }}</p>
+                {% endif %}
+            </div>
+
+            <!-- Mock Revenue -->
+            <div class="stat-card">
+                <h2>Mock Revenue (PRO Users)</h2>
+                <p><strong>PRO Users:</strong> {{ mock_revenue.pro_users }}</p>
+                <p><strong>Monthly Revenue:</strong> ${{ mock_revenue.monthly_revenue_usd }}.00</p>
+                <p><strong>Yearly Revenue:</strong> ${{ mock_revenue.yearly_revenue_usd }}.00</p>
+                <p class="note">{{ mock_revenue.note }}</p>
+            </div>
+
+            <!-- Ollama Status -->
+            <div class="stat-card">
+                <h2>Ollama Status</h2>
+                {% if ollama_status.running %}
+                <p class="status running">● Running</p>
+                {% if ollama_status.models %}
+                <p><strong>Loaded Models:</strong></p>
+                <ul>
+                    {% for model in ollama_status.models %}
+                    <li>{{ model }}</li>
+                    {% endfor %}
+                </ul>
+                {% else %}
+                <p>No models currently loaded.</p>
+                {% endif %}
+                {% else %}
+                <p class="status stopped">● Stopped</p>
+                {% endif %}
+                {% if ollama_status.error %}
+                <p class="error">Error: {{ ollama_status.error }}</p>
+                {% endif %}
+            </div>
+
+            <!-- Telegram Bot Status -->
+            <div class="stat-card">
+                <h2>Telegram Bot Status</h2>
+                {% if telegram_status.running %}
+                <p class="status running">● Running (PID: {{ telegram_status.pid }})</p>
+                {% else %}
+                <p class="status stopped">● Stopped</p>
+                {% endif %}
+                {% if telegram_status.error %}
+                <p class="error">Error: {{ telegram_status.error }}</p>
+                {% endif %}
+            </div>
+
+            <!-- Recent Errors -->
+            <div class="stat-card">
+                <h2>Recent Error Logs</h2>
+                <ul>
+                    {% for error in recent_errors %}
+                    <li class="log-line">{{ error }}</li>
+                    {% endfor %}
+                </ul>
+                {% if recent_errors|length == 0 %}
+                <p>No recent errors.</p>
+                {% endif %}
+            </div>
+        </section>
+
+        <footer>
+            <p>RAVEN Local Admin Dashboard &copy; {{ timestamp[0:4] }}</p>
+        </footer>
+    </div>
+</body>
+</html>

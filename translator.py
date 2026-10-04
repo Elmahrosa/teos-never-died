@@ -24,6 +24,7 @@ instant, and measured 10/12 on a 12-language spot check.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -253,8 +254,13 @@ def detect_ex(text: str) -> Dict[str, Any]:
 _installed_cache: Optional[List[str]] = None
 
 
-def installed_models() -> List[str]:
-    """Model names Ollama reports. Cached for the process life."""
+def _fetch_installed_models() -> List[str]:
+    """Blocking model list fetch. Cached for the process life.
+
+    Split out from the async entry point because translate() is deliberately
+    synchronous: the bot runs it via asyncio.to_thread, so a blocking HTTP call
+    there is already off the event loop.
+    """
     global _installed_cache
     if _installed_cache is not None:
         return _installed_cache
@@ -269,11 +275,21 @@ def installed_models() -> List[str]:
     return _installed_cache
 
 
+async def installed_models() -> List[str]:
+    """Model names Ollama reports. Cached for the process life."""
+    if _installed_cache is not None:
+        return _installed_cache
+    return await asyncio.to_thread(_fetch_installed_models)
+
+
 def _model_present(name: str) -> bool:
+    """Synchronous model check. Callers on the event loop must warm the cache
+    with `await installed_models()` first."""
     if not name:
         return False
     base = name.split(":")[0]
-    return any(m == name or m.split(":")[0] == base for m in installed_models())
+    return any(m == name or m.split(":")[0] == base
+               for m in _fetch_installed_models())
 
 
 def active_model() -> str:
@@ -283,8 +299,10 @@ def active_model() -> str:
     return CHAT_MODEL
 
 
-def translation_status() -> Dict[str, Any]:
-    st = status()
+async def translation_status() -> Dict[str, Any]:
+    # Warm the cache off the loop, then the synchronous checks are free.
+    await installed_models()
+    st = await status()
     st.update({
         "translate_model": TRANSLATE_MODEL,
         "translate_model_installed": _model_present(TRANSLATE_MODEL),
@@ -297,9 +315,10 @@ def translation_status() -> Dict[str, Any]:
     return st
 
 
-def status() -> Dict[str, Any]:
+async def status() -> Dict[str, Any]:
+    await installed_models()
     return {
-        "ollama_reachable": bool(installed_models()),
+        "ollama_reachable": bool(_installed_cache),
         "needs": [] if _model_present(TRANSLATE_MODEL)
                  else ["ollama pull %s" % TRANSLATE_MODEL],
         "langdetect": LANGDETECT_AVAILABLE,

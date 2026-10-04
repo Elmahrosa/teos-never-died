@@ -88,6 +88,33 @@ PLAN_MAP: Dict[str, str] = {
 _seen_events: "OrderedDict[str, float]" = OrderedDict()
 
 
+# Telegram notification
+# ---------------------------------------------------------------------------
+# notify_telegram() runs on the FastAPI event loop, so an aiohttp ClientSession
+# cached here is created and reused by that one loop and stays valid. It is
+# closed in the shutdown handler below.
+_telegram_session = None
+
+
+def _get_telegram_session():
+    """Get or create the persistent Telegram API session."""
+    global _telegram_session
+    if _telegram_session is None or _telegram_session.closed:
+        import aiohttp
+
+        _telegram_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=20))
+    return _telegram_session
+
+
+async def _cleanup_telegram_session():
+    """Close the persistent Telegram API session."""
+    global _telegram_session
+    if _telegram_session is not None and not _telegram_session.closed:
+        await _telegram_session.close()
+    _telegram_session = None
+
+
 # ---------------------------------------------------------------------------
 # Signature verification
 # ---------------------------------------------------------------------------
@@ -267,7 +294,11 @@ def _is_paid(payload: Dict[str, Any]) -> bool:
 # Telegram notification
 # ---------------------------------------------------------------------------
 async def notify_telegram(telegram_id: str, tier: str, plan: str) -> bool:
-    """Best-effort upgrade notice. Failure never fails the webhook."""
+    """Best-effort upgrade notice. Failure never fails the webhook.
+
+    Uses a session cached on this event loop so repeat upgrades reuse the
+    connection; it is closed in the shutdown handler.
+    """
     # FIX 2: Reconcile token env var name to match .env and telegram_bot.py
     token = os.getenv("TELEGRAM_TOKEN", "").strip()
     if not NOTIFY_TELEGRAM or not token:
@@ -283,18 +314,13 @@ async def notify_telegram(telegram_id: str, tier: str, plan: str) -> bool:
         "Check your allowance with /my_usage."
     )
     try:
-        import requests  # noqa: F401
-
-        def _post():
-            return requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": telegram_id, "text": text},
-                timeout=20,
-            )
-
-        resp = await asyncio.to_thread(_post)
-        resp.raise_for_status()
-        return True
+        session = _get_telegram_session()
+        async with session.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": telegram_id, "text": text},
+        ) as resp:
+            resp.raise_for_status()
+            return True
     except Exception as exc:
         # Never echo the token or the URL it was embedded in.
         logger.warning("upgrade notification to %s failed: %s", telegram_id, type(exc).__name__)
@@ -334,16 +360,20 @@ if _HAVE_FASTAPI:
 
     @app.on_event("startup")
     async def _startup():
-        ok = await asyncio.to_thread(database.init_db)
+        ok = await database.init_db()
         logger.info("webhook starting - database %s, secret %s",
                     "ready" if ok else "UNAVAILABLE (in-memory fallback)",
                     "configured" if WEBHOOK_SECRET else "MISSING (webhook will 503)")
+
+    @app.on_event("shutdown")
+    async def _shutdown():
+        await _cleanup_telegram_session()
 
     @app.get("/health")
     async def health():
         return {
             "status": "ok",
-            "database": await asyncio.to_thread(database.db_available),
+            "database": await database.db_available(),
             "signature_verification": bool(WEBHOOK_SECRET),
             "plans": sorted(set(PLAN_MAP.values())),
         }

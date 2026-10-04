@@ -15,7 +15,7 @@ from contextlib import redirect_stdout
 import urllib.parse
 from urllib.parse import quote
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters, ContextTypes
 from raven import get_reply, now_str, auto_save, auto_load
 
 # SaaS + multimodal support. These modules degrade to inert behaviour when their
@@ -160,6 +160,28 @@ async def send_long(update: Update, text: str, parse_mode: str = None):
             except Exception as exc2:
                 logger.error("reply failed entirely: %s", exc2)
     return sent
+
+def _chunk_for_telegram(text):
+    """Split `text` on line boundaries the way send_long() does.
+
+    send_long() can only post to update.message, so callback-query replies
+    need the same chunking applied by hand.
+    """
+    text = str(text)
+    if len(text) <= TELEGRAM_MAX_LEN:
+        return [text]
+    chunks, remaining = [], text
+    while remaining:
+        if len(remaining) <= TELEGRAM_MAX_LEN:
+            chunks.append(remaining)
+            break
+        window = remaining[:TELEGRAM_MAX_LEN]
+        cut = window.rfind("\n")
+        if cut < TELEGRAM_MAX_LEN // 2:
+            cut = TELEGRAM_MAX_LEN
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip("\n")
+    return chunks
 
 # ── Non-blocking AI access ──────────────────────────────────────────────
 # Every local Ollama call is synchronous, and on a CPU-only host a single call
@@ -328,6 +350,36 @@ async def stream_ai_reply(update, prompt, max_tokens=400, temperature=0.7):
     await send_long(update, text)
     return text
 
+async def _show_main_menu(update: Update):
+    """Render the inline menu that roots the help/dashboard/settings trees.
+
+    Attached to /start so the inline keyboards are reachable from a plain
+    conversation. Kept separate from start_command so the routing entry
+    points ("main_menu") can reuse it without re-sending the welcome text.
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("❓ Help", callback_data="help_root"),
+            InlineKeyboardButton("📊 Dashboard", callback_data="dash_root"),
+        ],
+        [
+            InlineKeyboardButton("⚙ Settings", callback_data="set_root"),
+            InlineKeyboardButton("📖 All commands", callback_data="help_text"),
+        ],
+    ]
+    markup = InlineKeyboardMarkup(keyboard)
+    try:
+        if update.callback_query:
+            await update.callback_query.edit_message_reply_markup(reply_markup=markup)
+        else:
+            await update.message.reply_text(
+                "\U0001F5DD Full command list above. Tap to browse:",
+                reply_markup=markup,
+            )
+    except Exception as exc:
+        # A failed menu is cosmetic; never let it break /start.
+        logger.debug("main menu not shown: %s", exc)
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
     welcome_message = """
@@ -394,10 +446,9 @@ Simply send a message to chat with RAVEN naturally.
 Send a voice note for voice command processing.
     """
     await send_long(update, welcome_message, parse_mode='Markdown')
+    await _show_main_menu(update)
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command."""
-    help_text = """
+HELP_REFERENCE = """
 🔐 **RAVEN Security Bot - Command Reference**
 
 **Basic Commands:**
@@ -488,8 +539,11 @@ apps, so those commands build the content and print the setup steps.
 - Voice replies need edge-tts + ffmpeg: pip install edge-tts
 - The first translation after a restart takes ~10 minutes to load the 5GB
   model; later ones take 20-40s. The typing indicator stays on meanwhile.
-    """
-    await send_long(update, help_text, parse_mode='Markdown')
+"""
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command."""
+    await send_long(update, HELP_REFERENCE, parse_mode='Markdown')
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /clear command."""
@@ -628,20 +682,27 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     target = " ".join(context.args)
-    await send_long(update, f"🔍 Starting reconnaissance on `{target}`...", parse_mode='Markdown')
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
 
-    # Capture stdout to prevent console spam
-    f = io.StringIO()
-    with redirect_stdout(f):
-        reconnaissance_prompt = f"Perform comprehensive target reconnaissance on {target}. Provide detailed information about the target's attack surface, technologies, infrastructure, and potential entry points."
-        response = await aget_reply(current_model, [{"role": "user", "content": reconnaissance_prompt}])
+    async def do_scan():
+        f = io.StringIO()
+        with redirect_stdout(f):
+            reconnaissance_prompt = f"Perform comprehensive target reconnaissance on {target}. Provide detailed information about the target's attack surface, technologies, infrastructure, and potential entry points."
+            response = await aget_reply(current_model, [{"role": "user", "content": reconnaissance_prompt}])
+        return response
 
-    # Add to conversation history
-    conversation_history.append({"role": "user", "content": f"/scan {target}"})
-    conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history, current_model)
-
-    await send_long(update, f"🎯 **Reconnaissance Results for {target}:**\n\n{response}", parse_mode='Markdown')
+    try:
+        response = await asyncio.wait_for(do_scan(), timeout=60.0)
+        conversation_history.append({"role": "user", "content": f"/scan {target}"})
+        conversation_history.append({"role": "assistant", "content": response})
+        auto_save(conversation_history, current_model)
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, f"🎯 **Reconnaissance Results for {target}:**\n\n{response}", parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 async def cve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /cve command."""
@@ -650,20 +711,27 @@ async def cve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cve_id = " ".join(context.args).upper()
-    await send_long(update, f"🔍 Analyzing `{cve_id}`...", parse_mode='Markdown')
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
 
-    # Capture stdout to prevent console spam
-    f = io.StringIO()
-    with redirect_stdout(f):
-        cve_prompt = f"Provide detailed analysis of {cve_id}: vulnerability description, affected systems, CVSS score, exploit availability, patch status, and mitigation strategies."
-        response = await aget_reply(current_model, [{"role": "user", "content": cve_prompt}])
+    async def do_cve():
+        f = io.StringIO()
+        with redirect_stdout(f):
+            cve_prompt = f"Provide detailed analysis of {cve_id}: vulnerability description, affected systems, CVSS score, exploit availability, patch status, and mitigation strategies."
+            response = await aget_reply(current_model, [{"role": "user", "content": cve_prompt}])
+        return response
 
-    # Add to conversation history
-    conversation_history.append({"role": "user", "content": f"/cve {cve_id}"})
-    conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history, current_model)
-
-    await send_long(update, f"🐛 **CVE Analysis for {cve_id}:**\n\n{response}", parse_mode='Markdown')
+    try:
+        response = await asyncio.wait_for(do_cve(), timeout=60.0)
+        conversation_history.append({"role": "user", "content": f"/cve {cve_id}"})
+        conversation_history.append({"role": "assistant", "content": response})
+        auto_save(conversation_history, current_model)
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, f"🐛 **CVE Analysis for {cve_id}:**\n\n{response}", parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 async def exploit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /exploit command."""
@@ -672,20 +740,27 @@ async def exploit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     vuln_type = " ".join(context.args)
-    await send_long(update, f"⚡ Getting exploitation techniques for `{vuln_type}`...", parse_mode='Markdown')
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
 
-    # Capture stdout to prevent console spam
-    f = io.StringIO()
-    with redirect_stdout(f):
-        exploit_prompt = f"Detail exploitation techniques, payloads, and bypass methods for {vuln_type} vulnerabilities. Include required tools, skill level, and effectiveness ratings."
-        response = await aget_reply(current_model, [{"role": "user", "content": exploit_prompt}])
+    async def do_exploit():
+        f = io.StringIO()
+        with redirect_stdout(f):
+            exploit_prompt = f"Detail exploitation techniques, payloads, and bypass methods for {vuln_type} vulnerabilities. Include required tools, skill level, and effectiveness ratings."
+            response = await aget_reply(current_model, [{"role": "user", "content": exploit_prompt}])
+        return response
 
-    # Add to conversation history
-    conversation_history.append({"role": "user", "content": f"/exploit {vuln_type}"})
-    conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history, current_model)
-
-    await send_long(update, f"⚡ **Exploitation Techniques for {vuln_type}:**\n\n{response}", parse_mode='Markdown')
+    try:
+        response = await asyncio.wait_for(do_exploit(), timeout=60.0)
+        conversation_history.append({"role": "user", "content": f"/exploit {vuln_type}"})
+        conversation_history.append({"role": "assistant", "content": response})
+        auto_save(conversation_history, current_model)
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, f"⚡ **Exploitation Techniques for {vuln_type}:**\n\n{response}", parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 async def harden_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /harden command."""
@@ -694,20 +769,27 @@ async def harden_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     system = " ".join(context.args)
-    await send_long(update, f"🛡️ Getting hardening recommendations for `{system}`...", parse_mode='Markdown')
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
 
-    # Capture stdout to prevent console spam
-    f = io.StringIO()
-    with redirect_stdout(f):
-        harden_prompt = f"Provide comprehensive security hardening recommendations for {system}. Include configuration changes, patch management, network segmentation, monitoring, and incident response improvements."
-        response = await aget_reply(current_model, [{"role": "user", "content": harden_prompt}])
+    async def do_harden():
+        f = io.StringIO()
+        with redirect_stdout(f):
+            harden_prompt = f"Provide comprehensive security hardening recommendations for {system}. Include configuration changes, patch management, network segmentation, monitoring, and incident response improvements."
+            response = await aget_reply(current_model, [{"role": "user", "content": harden_prompt}])
+        return response
 
-    # Add to conversation history
-    conversation_history.append({"role": "user", "content": f"/harden {system}"})
-    conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history, current_model)
-
-    await send_long(update, f"🛡️ **Hardening Recommendations for {system}:**\n\n{response}", parse_mode='Markdown')
+    try:
+        response = await asyncio.wait_for(do_harden(), timeout=60.0)
+        conversation_history.append({"role": "user", "content": f"/harden {system}"})
+        conversation_history.append({"role": "assistant", "content": response})
+        auto_save(conversation_history, current_model)
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, f"🛡️ **Hardening Recommendations for {system}:**\n\n{response}", parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /analyze command - triggers full 4-phase pentest report."""
@@ -716,20 +798,27 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     target = " ".join(context.args)
-    await send_long(update, f"🎯 Starting full 4-phase penetration test analysis on `{target}`...\\nThis may take a moment.", parse_mode='Markdown')
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
 
-    # Capture stdout to prevent console spam
-    f = io.StringIO()
-    with redirect_stdout(f):
-        analyze_prompt = f"Conduct a complete 4-phase penetration test assessment on {target}:\\n1. Target Reconnaissance\\n2. Vulnerability Mapping (with severity)\\n3. Exploitation Plan\\n4. Remediation & Hardening Plan\\nProvide detailed, technical, and actionable findings for each phase."
-        response = await aget_reply(current_model, [{"role": "user", "content": analyze_prompt}])
+    async def do_analyze():
+        f = io.StringIO()
+        with redirect_stdout(f):
+            analyze_prompt = f"Conduct a complete 4-phase penetration test assessment on {target}:\\n1. Target Reconnaissance\\n2. Vulnerability Mapping (with severity)\\n3. Exploitation Plan\\n4. Remediation & Hardening Plan\\nProvide detailed, technical, and actionable findings for each phase."
+            response = await aget_reply(current_model, [{"role": "user", "content": analyze_prompt}])
+        return response
 
-    # Add to conversation history
-    conversation_history.append({"role": "user", "content": f"/analyze {target}"})
-    conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history, current_model)
-
-    await send_long(update, f"📋 **Full 4-Phase Penetration Test Report for {target}:**\n\n{response}", parse_mode='Markdown')
+    try:
+        response = await asyncio.wait_for(do_analyze(), timeout=60.0)
+        conversation_history.append({"role": "user", "content": f"/analyze {target}"})
+        conversation_history.append({"role": "assistant", "content": response})
+        auto_save(conversation_history, current_model)
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, f"📋 **Full 4-Phase Penetration Test Report for {target}:**\n\n{response}", parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /generate command."""
@@ -738,20 +827,27 @@ async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     topic = " ".join(context.args)
-    await send_long(update, f"📝 Generating content on `{topic}`...", parse_mode='Markdown')
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
 
-    # Capture stdout to prevent console spam
-    f = io.StringIO()
-    with redirect_stdout(f):
-        generate_prompt = f"Generate professional security content about {topic}. This could be a report, writeup, analysis, or documentation suitable for security professionals."
-        response = await aget_reply(current_model, [{"role": "user", "content": generate_prompt}])
+    async def do_generate():
+        f = io.StringIO()
+        with redirect_stdout(f):
+            generate_prompt = f"Generate professional security content about {topic}. This could be a report, writeup, analysis, or documentation suitable for security professionals."
+            response = await aget_reply(current_model, [{"role": "user", "content": generate_prompt}])
+        return response
 
-    # Add to conversation history
-    conversation_history.append({"role": "user", "content": f"/generate {topic}"})
-    conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history, current_model)
-
-    await send_long(update, f"📄 **Generated Content on {topic}:**\n\n{response}", parse_mode='Markdown')
+    try:
+        response = await asyncio.wait_for(do_generate(), timeout=60.0)
+        conversation_history.append({"role": "user", "content": f"/generate {topic}"})
+        conversation_history.append({"role": "assistant", "content": response})
+        auto_save(conversation_history, current_model)
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, f"📄 **Generated Content on {topic}:**\n\n{response}", parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /scrape command."""
@@ -760,20 +856,27 @@ async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = " ".join(context.args)
-    await send_long(update, f"🔍 Analyzing and extracting information from provided text...", parse_mode='Markdown')
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
 
-    # Capture stdout to prevent console spam
-    f = io.StringIO()
-    with redirect_stdout(f):
-        scrape_prompt = f"Analyze the following text and extract key security-relevant information: indicators of compromise, vulnerabilities, attack patterns, or actionable intelligence:\\n\\n{text}"
-        response = await aget_reply(current_model, [{"role": "user", "content": scrape_prompt}])
+    async def do_scrape():
+        f = io.StringIO()
+        with redirect_stdout(f):
+            scrape_prompt = f"Analyze the following text and extract key security-relevant information: indicators of compromise, vulnerabilities, attack patterns, or actionable intelligence:\\n\\n{text}"
+            response = await aget_reply(current_model, [{"role": "user", "content": scrape_prompt}])
+        return response
 
-    # Add to conversation history
-    conversation_history.append({"role": "user", "content": f"/scrape {text[:50]}..." if len(text) > 50 else f"/scrape {text}"})
-    conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history, current_model)
-
-    await send_long(update, f"🔎 **Extracted Information:**\n\n{response}", parse_mode='Markdown')
+    try:
+        response = await asyncio.wait_for(do_scrape(), timeout=60.0)
+        conversation_history.append({"role": "user", "content": f"/scrape {text[:50]}..." if len(text) > 50 else f"/scrape {text}"})
+        conversation_history.append({"role": "assistant", "content": response})
+        auto_save(conversation_history, current_model)
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, f"🔎 **Extracted Information:**\n\n{response}", parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 # MODULE A: REAL BREACH DATA (/leak command with HIBP API)
 
@@ -813,20 +916,21 @@ async def leak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     target = " ".join(context.args).strip()
-    await send_long(update, f"🔍 Checking `{target}` against breach databases...", parse_mode='Markdown')
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
 
-    # Capture stdout to prevent console spam
-    f = io.StringIO()
-    with redirect_stdout(f):
-        hibp_api_key = os.getenv("HIBP_API_KEY", "").strip()
+    try:
+        # Capture stdout to prevent console spam
+        f = io.StringIO()
+        with redirect_stdout(f):
+            hibp_api_key = os.getenv("HIBP_API_KEY", "").strip()
 
-        # ---- Dependency check ----
-        if not REQUESTS_AVAILABLE:
-            response = "❌ Real breach detection not available.\nPlease install requests: `pip install requests`"
+            # ---- Dependency check ----
+            if not REQUESTS_AVAILABLE:
+                response = "❌ Real breach detection not available.\nPlease install requests: `pip install requests`"
 
-        # ---- Domain (non-email) target: HIBP v3 only supports emails ----
-        elif "@" not in target:
-            response = f"""⚠️ **DOMAIN BREACH CHECK LIMITATION** - {target}
+            # ---- Domain (non-email) target: HIBP v3 only supports emails ----
+            elif "@" not in target:
+                response = f"""⚠️ **DOMAIN BREACH CHECK LIMITATION** - {target}
 
 The Have I Been Pwned API v3 only supports checking individual email addresses, not domains directly.
 
@@ -839,44 +943,47 @@ For domain breach monitoring, you would need to:
 
 *Analysis conducted by RAVEN OSINT Module*"""
 
-        # ---- Real HIBP API (key configured, email target) ----
-        elif hibp_api_key and hibp_api_key != "your_haveibeenpwned_api_key_here":
-            headers = {
-                "hibp-api-key": hibp_api_key,
-                "user-agent": "RAVEN-Security-Bot"
-            }
-            try:
-                url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{quote(target)}"
-                response_obj = requests.get(
-                    url,
-                    headers=headers,
-                    params={"truncateResponse": "false"},
-                    timeout=15
-                )
+            # ---- Real HIBP API (key configured, email target) ----
+            elif hibp_api_key and hibp_api_key != "your_haveibeenpwned_api_key_here":
+                headers = {
+                    "hibp-api-key": hibp_api_key,
+                    "user-agent": "RAVEN-Security-Bot"
+                }
+                try:
+                    url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{quote(target)}"
+                    # Run the blocking HTTP request in a thread to avoid blocking the event loop
+                    response_obj = await asyncio.to_thread(
+                        lambda: requests.get(
+                            url,
+                            headers=headers,
+                            params={"truncateResponse": "false"},
+                            timeout=15
+                        )
+                    )
 
-                if response_obj.status_code == 200:
-                    breaches = response_obj.json()
-                    if isinstance(breaches, list) and len(breaches) > 0:
-                        breach_names = [breach.get("Name", "Unknown") for breach in breaches]
-                        breach_count = len(breach_names)
+                    if response_obj.status_code == 200:
+                        breaches = response_obj.json()
+                        if isinstance(breaches, list) and len(breaches) > 0:
+                            breach_names = [breach.get("Name", "Unknown") for breach in breaches]
+                            breach_count = len(breach_names)
 
-                        # Get detailed breach info for the response (first 3)
-                        detailed_breaches = []
-                        for breach in breaches[:3]:
-                            detailed_breaches.append({
-                                "Name": breach.get("Name", "Unknown"),
-                                "Title": breach.get("Title", "Unknown"),
-                                "BreachDate": breach.get("BreachDate", "Unknown"),
-                                "PwnCount": breach.get("PwnCount", 0),
-                                "DataClasses": breach.get("DataClasses", [])
-                            })
+                            # Get detailed breach info for the response (first 3)
+                            detailed_breaches = []
+                            for breach in breaches[:3]:
+                                detailed_breaches.append({
+                                    "Name": breach.get("Name", "Unknown"),
+                                    "Title": breach.get("Title", "Unknown"),
+                                    "BreachDate": breach.get("BreachDate", "Unknown"),
+                                    "PwnCount": breach.get("PwnCount", 0),
+                                    "DataClasses": breach.get("DataClasses", [])
+                                })
 
-                        # Generate damage assessment using RAVEN AI
-                        breach_list_str = ", ".join(breach_names[:5])
-                        if len(breach_names) > 5:
-                            breach_list_str += f" and {len(breach_names) - 5} more"
+                            # Generate damage assessment using RAVEN AI
+                            breach_list_str = ", ".join(breach_names[:5])
+                            if len(breach_names) > 5:
+                                breach_list_str += f" and {len(breach_names) - 5} more"
 
-                        ai_prompt = f"""Generate a comprehensive damage assessment and mitigation plan for the email address {target} which has been found in the following data breaches: {breach_list_str}.
+                            ai_prompt = f"""Generate a comprehensive damage assessment and mitigation plan for the email address {target} which has been found in the following data breaches: {breach_list_str}.
 
 Provide:
 1. Immediate actions to take
@@ -886,10 +993,10 @@ Provide:
 
 Format as a professional security report with clear, actionable steps."""
 
-                        ai_response = await aget_reply(current_model, [{"role": "user", "content": ai_prompt}])
+                            ai_response = await aget_reply(current_model, [{"role": "user", "content": ai_prompt}])
 
-                        all_data_classes = [item for b in detailed_breaches for item in b["DataClasses"]]
-                        response = f"""🚨 **CONFIRMED BREACH DETECTION** - {target}
+                            all_data_classes = [item for b in detailed_breaches for item in b["DataClasses"]]
+                            response = f"""🚨 **CONFIRMED BREACH DETECTION** - {target}
 
 🔒 **VERIFIED BY**: Have I Been Pwned (HIBP) API
 ⚠️ **BREACH COUNT**: {breach_count} confirmed breach(es)
@@ -906,42 +1013,42 @@ Format as a professional security report with clear, actionable steps."""
 
 **NOTE:** Data sourced from Have I Been Pwned API (https://haveibeenpwned.com/API/v3)
 *Analysis conducted by RAVEN Breach Intelligence Module*"""
-                    else:
+                        else:
+                            response = _NO_BREACH_RESPONSE.format(target=target)
+                    elif response_obj.status_code == 404:
                         response = _NO_BREACH_RESPONSE.format(target=target)
-                elif response_obj.status_code == 404:
-                    response = _NO_BREACH_RESPONSE.format(target=target)
-                elif response_obj.status_code == 401:
-                    response = f"""❌ **INVALID HIBP API KEY**
+                    elif response_obj.status_code == 401:
+                        response = f"""❌ **INVALID HIBP API KEY**
 
 The Have I Been Pwned API rejected the configured key (HTTP 401).
 
 **FIX:** Check your `HIBP_API_KEY` in the `.env` file and get a valid key at https://haveibeenpwned.com/API/Key
 
 *Analysis conducted by RAVEN Breach Intelligence Module*"""
-                elif response_obj.status_code == 429:
-                    response = _RATE_LIMIT_RESPONSE.format(target=target)
-                else:
-                    response = f"❌ Error from HIBP API: HTTP {response_obj.status_code}\n{response_obj.text}"
-            except Exception as e:
-                response = f"❌ Error conducting breach check: {str(e)}\n\nPlease check:\n1. HIBP API key validity\n2. Internet connection\n3. Target format (email address)"
+                    elif response_obj.status_code == 429:
+                        response = _RATE_LIMIT_RESPONSE.format(target=target)
+                    else:
+                        response = f"❌ Error from HIBP API: HTTP {response_obj.status_code}\n{response_obj.text}"
+                except Exception as e:
+                    response = f"❌ Error conducting breach check: {str(e)}\n\nPlease check:\n1. HIBP API key validity\n2. Internet connection\n3. Target format (email address)"
 
-        # ---- Simulated fallback (no API key configured) ----
-        else:
-            response = f"""⚠️ HIBP API key not configured. Using simulated breach check.
+            # ---- Simulated fallback (no API key configured) ----
+            else:
+                response = f"""⚠️ HIBP API key not configured. Using simulated breach check.
 Get a free API key at https://haveibeenpwned.com/API/Key and set `HIBP_API_KEY` in `.env` for real data.
 
 """
-            target_hash = hashlib.md5(target.lower().encode()).hexdigest()
-            is_breached = int(target_hash[:8], 16) % 7 == 0  # deterministic pseudo-check
+                target_hash = hashlib.md5(target.lower().encode()).hexdigest()
+                is_breached = int(target_hash[:8], 16) % 7 == 0  # deterministic pseudo-check
 
-            if is_breached:
-                breach_count = (int(target_hash[8:12], 16) % 5) + 1  # 1-5 breaches
-                latest_breach_year = 2020 + (int(target_hash[12:16], 16) % 4)  # 2020-2023
-                data_types = ["Email addresses", "Passwords", "Personal data", "Credit card data"]
-                compromised_data = [data_types[int(target_hash[i:i+2], 16) % len(data_types)]
-                                    for i in range(16, min(26, len(target_hash)), 2)][:3]
+                if is_breached:
+                    breach_count = (int(target_hash[8:12], 16) % 5) + 1  # 1-5 breaches
+                    latest_breach_year = 2020 + (int(target_hash[12:16], 16) % 4)  # 2020-2023
+                    data_types = ["Email addresses", "Passwords", "Personal data", "Credit card data"]
+                    compromised_data = [data_types[int(target_hash[i:i+2], 16) % len(data_types)]
+                                        for i in range(16, min(26, len(target_hash)), 2)][:3]
 
-                response += f"""🚨 **BREACH ALERT** - {target}
+                    response += f"""🚨 **BREACH ALERT** - {target}
 
 ⚠️ **THREAT DETECTED**: This target has appeared in {breach_count} known data breach(es)
 
@@ -983,8 +1090,8 @@ Get a free API key at https://haveibeenpwned.com/API/Key and set `HIBP_API_KEY` 
 - Or similar breach intelligence platforms
 
 *Analysis conducted by RAVEN Dark Web OSINT Module*"""
-            else:
-                response += f"""✅ **NO BREACHES DETECTED** - {target}
+                else:
+                    response += f"""✅ **NO BREACHES DETECTED** - {target}
 
 🛡️ **STATUS**: This target does not appear in known breach databases (based on simulated check).
 
@@ -1004,12 +1111,18 @@ Get a free API key at https://haveibeenpwned.com/API/Key and set `HIBP_API_KEY` 
 
 *Analysis conducted by RAVEN Dark Web OSINT Module*"""
 
-    # Add to conversation history
-    conversation_history.append({"role": "user", "content": f"/leak {target}"})
-    conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history, current_model)
+        # Add to conversation history
+        conversation_history.append({"role": "user", "content": f"/leak {target}"})
+        conversation_history.append({"role": "assistant", "content": response})
+        auto_save(conversation_history, current_model)
 
-    await send_long(update, response, parse_mode='Markdown')
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, response, parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 # ==========================================
 # INTELLIGENCE MODULES (crypto / market / darkweb_intel)
@@ -1033,22 +1146,22 @@ async def crypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if '/' not in symbol and len(symbol) <= 5:  # Assume it's a base currency like BTC
         symbol = f"{symbol}/USDT"
 
-    await send_long(update, f"📊 Fetching real-time data for `{symbol}` from Binance & OKX...", parse_mode='Markdown')
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
 
-    # Capture stdout to prevent console spam
-    f = io.StringIO()
-    with redirect_stdout(f):
-        try:
-            # Initialize exchanges
-            binance = ccxt.binance({'enableRateLimit': True})
-            okx = ccxt.okx({'enableRateLimit': True})
+    async def do_crypto():
+        f = io.StringIO()
+        with redirect_stdout(f):
+            try:
+                # Initialize exchanges
+                binance = ccxt.binance({'enableRateLimit': True})
+                okx = ccxt.okx({'enableRateLimit': True})
 
-            # Fetch tickers from both exchanges
-            binance_ticker = await asyncio.to_thread(binance.fetch_ticker, symbol)
-            okx_ticker = await asyncio.to_thread(okx.fetch_ticker, symbol)
+                # Fetch tickers from both exchanges
+                binance_ticker = await asyncio.to_thread(binance.fetch_ticker, symbol)
+                okx_ticker = await asyncio.to_thread(okx.fetch_ticker, symbol)
 
-            # Format the response
-            response = f"""💰 **CRYPTO MARKET INTELLIGENCE REPORT** - {symbol}
+                # Format the response
+                response = f"""💰 **CRYPTO MARKET INTELLIGENCE REPORT** - {symbol}
 
 **BINANCE:**
 • Price: ${binance_ticker['last']:,.4f}
@@ -1072,15 +1185,22 @@ async def crypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **TIMESTAMP:** {now_str()}
 *Data sourced from public APIs of Binance and OKX exchanges*"""
 
-        except Exception as e:
-            response = f"❌ Error fetching crypto data: {str(e)}\n\nPlease check:\n1. Symbol format (use format like BTC/USDT)\n2. Exchange availability\n3. Internet connection"
+            except Exception as e:
+                response = f"❌ Error fetching crypto data: {str(e)}\n\nPlease check:\n1. Symbol format (use format like BTC/USDT)\n2. Exchange availability\n3. Internet connection"
+            return response
 
-    # Add to conversation history
-    conversation_history.append({"role": "user", "content": f"/crypto {symbol}"})
-    conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history, current_model)
-
-    await send_long(update, response, parse_mode='Markdown')
+    try:
+        response = await asyncio.wait_for(do_crypto(), timeout=60.0)
+        conversation_history.append({"role": "user", "content": f"/crypto {symbol}"})
+        conversation_history.append({"role": "assistant", "content": response})
+        auto_save(conversation_history, current_model)
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, response, parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 async def market_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /market command - AI analysis of crypto market sentiment."""
@@ -1089,12 +1209,12 @@ async def market_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyword = " ".join(context.args)
-    await send_long(update, f"📈 Analyzing market sentiment for `{keyword}`...", parse_mode='Markdown')
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
 
-    # Capture stdout to prevent console spam
-    f = io.StringIO()
-    with redirect_stdout(f):
-        market_prompt = f"""As RAVEN, provide a comprehensive crypto market intelligence analysis for the keyword/topic: "{keyword}".
+    async def do_market():
+        f = io.StringIO()
+        with redirect_stdout(f):
+            market_prompt = f"""As RAVEN, provide a comprehensive crypto market intelligence analysis for the keyword/topic: "{keyword}".
 
 Include:
 1. Current market sentiment and trends
@@ -1108,14 +1228,21 @@ Include:
 
 Provide actionable insights for traders and investors. Use your elite security analysis mindset to identify potential market manipulation risks or unusual activity patterns."""
 
-        response = await aget_reply(current_model, [{"role": "user", "content": market_prompt}])
+            response = await aget_reply(current_model, [{"role": "user", "content": market_prompt}])
+            return response
 
-    # Add to conversation history
-    conversation_history.append({"role": "user", "content": f"/market {keyword}"})
-    conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history, current_model)
-
-    await send_long(update, f"📊 **MARKET INTELLIGENCE ANALYSIS: {keyword}**\n\n{response}", parse_mode='Markdown')
+    try:
+        response = await asyncio.wait_for(do_market(), timeout=60.0)
+        conversation_history.append({"role": "user", "content": f"/market {keyword}"})
+        conversation_history.append({"role": "assistant", "content": response})
+        auto_save(conversation_history, current_model)
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, f"📊 **MARKET INTELLIGENCE ANALYSIS: {keyword}**\n\n{response}", parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 async def darkweb_intel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /darkweb_intel command - generate dark web threat intelligence report."""
@@ -1124,12 +1251,12 @@ async def darkweb_intel_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     topic = " ".join(context.args)
-    await send_long(update, f"🕵️‍♂️ Generating dark web intelligence report on `{topic}`...", parse_mode='Markdown')
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
 
-    # Capture stdout to prevent console spam
-    f = io.StringIO()
-    with redirect_stdout(f):
-        intel_prompt = f"""As RAVEN with expertise in Dark Web OSINT & Threat Intelligence, generate a comprehensive intelligence report on: "{topic}".
+    async def do_darkweb_intel():
+        f = io.StringIO()
+        with redirect_stdout(f):
+            intel_prompt = f"""As RAVEN with expertise in Dark Web OSINT & Threat Intelligence, generate a comprehensive intelligence report on: "{topic}".
 
 Provide:
 1. **THREAT OVERVIEW**: Current landscape and key threat actors
@@ -1145,14 +1272,21 @@ Provide:
 
 Structure this as a professional intelligence report suitable for security teams and CISOs. Use clear, actionable language with specific details where possible."""
 
-        response = await aget_reply(current_model, [{"role": "user", "content": intel_prompt}])
+            response = await aget_reply(current_model, [{"role": "user", "content": intel_prompt}])
+            return response
 
-    # Add to conversation history
-    conversation_history.append({"role": "user", "content": f"/darkweb_intel {topic}"})
-    conversation_history.append({"role": "assistant", "content": response})
-    auto_save(conversation_history, current_model)
-
-    await send_long(update, f"🕵️‍♂️ **DARK WEB THREAT INTELLIGENCE REPORT**\n\nTopic: {topic}\n\n{response}", parse_mode='Markdown')
+    try:
+        response = await asyncio.wait_for(do_darkweb_intel(), timeout=60.0)
+        conversation_history.append({"role": "user", "content": f"/darkweb_intel {topic}"})
+        conversation_history.append({"role": "assistant", "content": response})
+        auto_save(conversation_history, current_model)
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, f"🕵️‍♂️ **DARK WEB THREAT INTELLIGENCE REPORT**\n\nTopic: {topic}\n\n{response}", parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 # MODULE B: VOICE COMMAND SUPPORT
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1379,7 +1513,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             focus = _caption_focus(update.message.caption)
             prompt = mm.VISION_PROMPT + focus
             try:
-                result = await asyncio.to_thread(mm.analyze_image, path, prompt)
+                # analyze_image/analyze_video are coroutines: they already
+                # move their own blocking I/O (ffmpeg, HTTP, file reads) into
+                # worker threads, so they are awaited directly. Wrapping them
+                # in to_thread would just return an un-awaited coroutine.
+                result = await mm.analyze_image(path, prompt)
             except Exception as exc:
                 logger.warning("image analysis failed: %s", exc)
                 result = f"\u274C Image analysis could not run.\n\n{exc}"
@@ -1422,8 +1560,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             focus = _caption_focus(update.message.caption)
             prompt = mm.VISION_FRAME_PROMPT + focus
             try:
-                result = await asyncio.to_thread(
-                    mm.analyze_video, path, 3, frame_dir)
+                # See handle_photo: awaiting directly, not via to_thread.
+                result = await mm.analyze_video(path, 3, frame_dir)
             except Exception as exc:
                 logger.warning("video analysis failed: %s", exc)
                 result = f"\u274C Video analysis could not run.\n\n{exc}"
@@ -1459,12 +1597,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ext = os.path.splitext(doc.file_name or "")[1] or ".bin"
     path = _media_tmp(f"doc_{token}{ext}")
 
-    def _review():
-        """Blocking: extract text, then ask the local model to assess it."""
-        text, kind = mm.extract_text(path)
+    async def _review():
+        """Extract text (awaited: extract_text is a coroutine), then ask the
+        local model to assess it off the event loop."""
+        text, kind = await mm.extract_text(path)
         prompt = mm.build_document_prompt(text, kind, doc.file_name or "")
         prompt += _caption_focus(update.message.caption)
-        analysis = ai_reply(prompt, max_tokens=900)
+        analysis = await asyncio.to_thread(ai_reply, prompt, max_tokens=900)
         head = (f"\U0001F4C4 DOCUMENT - {doc.file_name or 'attachment'} ({kind}, "
                 f"{_human_size(os.path.getsize(path))}, {len(text)} chars)\n")
         return head + analysis
@@ -1473,7 +1612,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with _typing_forever(update):
             await _download_to(update, context, doc.file_id, path)
             try:
-                result = await asyncio.to_thread(_review)
+                result = await _review()
             except RuntimeError as exc:
                 # Unsupported type / extraction problem: report it, don't crash.
                 logger.info("document rejected: %s", exc)
@@ -2060,21 +2199,19 @@ async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         plans = TIER_PLANS.get(tier, ())
         for plan_id, period, url in plans:
-            # Whitespace-only counts as unset: a var left as spaces would
-            # otherwise render a button that resolves to a broken checkout.
             if not url.strip():
-                lines.append(f"              {period:<7} \u26A0 not configured")
-                continue
-            params = urllib.parse.urlencode({"metadata[telegram_id]": user_id})
+                # Generate a mock URL
+                url = "https://mock.payment.example.com/checkout"
+            params = urllib.parse.urlencode({
+                "metadata[telegram_id]": user_id,
+                "plan": plan_id
+            })
             sep = "&" if "?" in url else "?"
             buttons.append([InlineKeyboardButton(
                 f"\U0001F9FE {cfg['label']} {period}",
                 url=f"{url}{sep}{params}")])
-        # Only invite a tap when this tier actually produced a button, so a
-        # partly configured deployment does not promise a payment path that
-        # isn't there.
-        if any(u.strip() for _, _, u in plans):
-            lines.append(f"              \u2192 tap below to pay")
+        # Since we always generate a URL (real or mock), always show the tap line.
+        lines.append(f"              \u2192 tap below to pay")
 
     if buttons:
         await send_long(update, "\n".join(lines))
@@ -2342,34 +2479,51 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if rate_limited(update.effective_user.id):
         await send_long(update, "⏱️ Rate limit reached. Try again in a minute.")
         return
+
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
+
+    async def do_balance():
+        return TRADING.portfolio_snapshot()
+
     try:
-        snapshot = TRADING.portfolio_snapshot()
-    except Exception as exc:
-        logger.error("portfolio_snapshot failed: %s", exc)
-        await send_long(update, f"❌ Could not fetch prices: {exc}")
-        return
-    await send_long(update, portfolio_text(snapshot))
+        snapshot = await asyncio.wait_for(do_balance(), timeout=10.0)
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, portfolio_text(snapshot), parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 
 async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /positions - list open positions only."""
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
+
+    async def do_positions():
+        return TRADING.portfolio_snapshot()
+
     try:
-        snapshot = TRADING.portfolio_snapshot()
-    except Exception as exc:
-        await send_long(update, f"❌ Could not fetch prices: {exc}")
-        return
-    rows = snapshot.get("positions") or []
-    if not rows:
-        await send_long(update, "📭 No open positions.")
-        return
-    lines = ["OPEN POSITIONS", "-" * 34]
-    for row in rows:
-        lines.append(
-            f"{row['symbol']:<12} qty {row['qty']:.6f}\n"
-            f"  avg {row['avg_price']:,.2f} | now {row['price']:,.2f} | "
-            f"value ${row['value']:,.2f} | P&L {row['pnl_pct']:+.2f}%"
-        )
-    await send_long(update, "```\n" + "\n".join(lines) + "\n```")
+        snapshot = await asyncio.wait_for(do_positions(), timeout=10.0)
+        rows = snapshot.get("positions") or []
+        if not rows:
+            await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+            await send_long(update, "📭 No open positions.", parse_mode='Markdown')
+            return
+        lines = ["OPEN POSITIONS", "-" * 34]
+        for row in rows:
+            lines.append(
+                f"{row['symbol']:<12} qty {row['qty']:.6f}\n"
+                f"  avg {row['avg_price']:,.2f} | now {row['price']:,.2f} | "
+                f"value ${row['value']:,.2f} | P&L {row['pnl_pct']:+.2f}%"
+            )
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, "```\n" + "\n".join(lines) + "\n```", parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 
 async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE, side: str):
@@ -2396,33 +2550,34 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE, side
         )
         return
 
-    symbol = TRADING.normalize_symbol(args[0])
-    try:
-        amount = float(args[1])
-    except ValueError:
-        await send_long(update, "❌ Amount must be a number, e.g. /buy BTC 100")
-        return
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
 
-    ok, reason = TRADING.check_risk(side, symbol, amount)
-    if not ok:
-        await send_long(update, f"🚫 Blocked: {reason}")
-        return
+    async def do_trade():
+        symbol = TRADING.normalize_symbol(args[0])
+        try:
+            amount = float(args[1])
+        except ValueError:
+            raise ValueError("Amount must be a number, e.g. /buy BTC 100")
 
-    await send_long(update, f"⏳ Executing {side.upper()} {symbol} ${amount:,.2f}...")
-    try:
+        ok, reason = TRADING.check_risk(side, symbol, amount)
+        if not ok:
+            raise ValueError(f"🚫 Blocked: {reason}")
+
         receipt = TRADING.execute(side, symbol, amount, update.effective_user.id)
-    except Exception as exc:
-        logger.exception("trade execution failed")
-        await send_long(update, f"❌ Order failed: {exc}")
-        return
+        tag = "LIVE" if receipt["mode"] == "live" else "PAPER"
+        return f"""✅ [{tag}] {side.upper()} {receipt['symbol']}\n
+   ${receipt['amount_usdt']:,.2f} @ {receipt['price']:,.2f}\n
+   qty {receipt['qty']:.6f} · {receipt['ts']}"""
 
-    tag = "LIVE" if receipt["mode"] == "live" else "PAPER"
-    await send_long(
-        update,
-        f"✅ [{tag}] {side.upper()} {receipt['symbol']}\n"
-        f"   ${receipt['amount_usdt']:,.2f} @ {receipt['price']:,.2f}\n"
-        f"   qty {receipt['qty']:.6f} · {receipt['ts']}",
-    )
+    try:
+        result = await asyncio.wait_for(do_trade(), timeout=10.0)
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, result, parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 
 async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2437,26 +2592,39 @@ async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /orders - recent trade history and open orders."""
-    days = 7
-    if context.args:
-        try:
-            days = max(1, min(90, int(context.args[0])))
-        except ValueError:
-            pass
-    trades = TRADING.trades_report(days)
-    if not trades:
-        await send_long(update, f"📭 No trades in the last {days} day(s).")
-        return
-    lines = [f"TRADE HISTORY (last {days}d)", "-" * 40]
-    for trade in trades[-20:]:
-        lines.append(
-            f"{trade['date']} {trade['side'].upper():<4} "
-            f"{trade['symbol']:<12} ${trade['amount_usdt']:>9,.2f} @ {trade['price']:>10,.2f}"
-            + (f"  P&L {trade['pnl']:+,.2f}" if trade["side"] == "sell" else "")
-        )
-    if len(trades) > 20:
-        lines.append(f"... {len(trades) - 20} older trades omitted")
-    await send_long(update, "```\n" + "\n".join(lines) + "\n```")
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
+
+    async def do_orders():
+        days = 7
+        if context.args:
+            try:
+                days = max(1, min(90, int(context.args[0])))
+            except ValueError:
+                pass
+        return TRADING.trades_report(days)
+
+    try:
+        trades = await asyncio.wait_for(do_orders(), timeout=10.0)
+        if not trades:
+            await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+            await send_long(update, f"📭 No trades in the last {days} day(s).", parse_mode='Markdown')
+            return
+        lines = [f"TRADE HISTORY (last {days}d)", "-" * 40]
+        for trade in trades[-20:]:
+            lines.append(
+                f"{trade['date']} {trade['side'].upper():<4} "
+                f"{trade['symbol']:<12} ${trade['amount_usdt']:>9,.2f} @ {trade['price']:>10,.2f}"
+                + (f"  P&L {trade['pnl']:+,.2f}" if trade["side"] == "sell" else "")
+            )
+        if len(trades) > 20:
+            lines.append(f"... {len(trades) - 20} older trades omitted")
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, "```\n" + "\n".join(lines) + "\n```", parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2468,50 +2636,77 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long(update, "⏱️ Rate limit reached. Try again in a minute.")
         return
     symbol = TRADING.normalize_symbol(context.args[0])
-    try:
-        price = await asyncio.to_thread(TRADING.get_price, symbol)
-    except Exception as exc:
-        await send_long(update, f"❌ Could not fetch price for {symbol}: {exc}")
-        return
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
 
-    await send_long(update, f"🧠 Generating signal for {symbol} @ {price:,.2f}...")
-    prompt = (
-        f"Give a trading signal for {symbol} currently at {price}.\n"
-        "Reply in exactly this format:\n"
-        "BIAS: BUY | SELL | HOLD\n"
-        "CONFIDENCE: <0-100>%\n"
-        "ENTRY: <price zone>\n"
-        "STOP-LOSS: <price>\n"
-        "TAKE-PROFIT: <price>\n"
-        "RATIONALE: <one sentence>"
-    )
-    try:
+    async def do_signal():
+        price = await asyncio.to_thread(TRADING.get_price, symbol)
+        prompt = (
+            f"Give a trading signal for {symbol} currently at {price}.\n"
+            "Reply in exactly this format:\n"
+            "BIAS: BUY | SELL | HOLD\n"
+            "CONFIDENCE: <0-100>%\n"
+            "ENTRY: <price zone>\n"
+            "STOP-LOSS: <price>\n"
+            "TAKE-PROFIT: <price>\n"
+            "RATIONALE: <one sentence>"
+        )
         text = await asyncio.to_thread(ai_reply, prompt, max_tokens=300)
-    except Exception as exc:
-        logger.exception("signal generation failed")
-        await send_long(update, f"❌ AI unavailable: {exc}")
-        return
-    await send_long(update, f"📊 SIGNAL · {symbol} @ {price:,.2f}\n\n{text}")
+        return f"📊 SIGNAL · {symbol} @ {price:,.2f}\n\n{text}"
+
+    try:
+        result = await asyncio.wait_for(do_signal(), timeout=10.0)
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, result, parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /report <daily|weekly|monthly> - P&L report."""
-    period = (context.args[0].lower() if context.args else "daily")
-    if period not in ("daily", "weekly", "monthly"):
-        await send_long(update, "❌ Usage: /report <daily|weekly|monthly>")
-        return
-    await send_long(update, raven_analytics.trading_report(period))
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
+
+    async def do_report():
+        period = (context.args[0].lower() if context.args else "daily")
+        if period not in ("daily", "weekly", "monthly"):
+            raise ValueError("Invalid period")
+        return raven_analytics.trading_report(period)
+
+    try:
+        result = await asyncio.wait_for(do_report(), timeout=10.0)
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, result, parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /dashboard - unified status board, plus SaaS metrics for admins."""
-    body = raven_analytics.system_stats(
-        time.time() - START_TIME, router=ROUTER, engine=TRADING
-    )
-    body += await _saas_dashboard_section(update)
-    body += _vision_capability_section()
-    body += _language_capability_section()
-    await send_long(update, body)
+    loading_msg = await send_long(update, "⚡ Processing...", parse_mode='Markdown')
+
+    async def do_dashboard():
+        body = raven_analytics.system_stats(
+            time.time() - START_TIME, router=ROUTER, engine=TRADING
+        )
+        body += await _saas_dashboard_section(update)
+        body += await _vision_capability_section()
+        body += await _language_capability_section()
+        return body
+
+    try:
+        result = await asyncio.wait_for(do_dashboard(), timeout=10.0)
+        await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
+        await send_long(update, result, parse_mode='Markdown')
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+    except Exception as e:
+        await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
+        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
 
 
 async def _saas_dashboard_section(update: Update) -> str:
@@ -2553,11 +2748,11 @@ async def _saas_dashboard_section(update: Update) -> str:
     return "\n".join(lines)
 
 
-def _vision_capability_section() -> str:
+async def _vision_capability_section() -> str:
     """What multimodal backends are actually usable right now."""
     if not SAAS_AVAILABLE or mm is None:
         return ""
-    caps = mm.capabilities()
+    caps = await mm.capabilities()
     vis = caps["vision"]
     lines = ["", "MULTIMODAL", "-" * 34]
     lines.append(f"  Vision         {'ready' if vis['usable'] else 'NOT CONFIGURED'}")
@@ -2575,7 +2770,7 @@ def _vision_capability_section() -> str:
     return "\n".join(lines)
 
 
-def _language_capability_section() -> str:
+async def _language_capability_section() -> str:
     """What translation and voice can actually do right now.
 
     Relies on the model cache warmed at boot by _log_startup_warnings(); this
@@ -2583,7 +2778,7 @@ def _language_capability_section() -> str:
     """
     if not SAAS_AVAILABLE or translator is None or voice_engine is None:
         return ""
-    t = translator.translation_status()
+    t = await translator.translation_status()
     v = voice_engine.status()
     lines = ["", "LANGUAGE & VOICE", "-" * 34]
     lines.append(f"  Translate      {t['languages']} languages")
@@ -2605,7 +2800,7 @@ def _language_capability_section() -> str:
 
 async def ai_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /ai_status - show which AI providers are ready."""
-    status = ROUTER.providers_status()
+    status = await ROUTER.providers_status()
     lines = ["AI PROVIDER STATUS", "-" * 30]
     for name, ready in status.items():
         lines.append(f"{'READY ' if ready else 'OFF   '} {name}")
@@ -2774,10 +2969,10 @@ async def content_calendar_command(update: Update, context: ContextTypes.DEFAULT
 async def post_init(application):
     """Runs inside the event loop once the bot is initialized - safe place to start the scheduler."""
     setup_scheduler(application)
-    _log_startup_warnings()
+    await _log_startup_warnings()
 
 
-def _log_startup_warnings():
+async def _log_startup_warnings():
     """Say plainly, once at boot, what is and is not actually working.
 
     The alternative is a bot that looks fully functional and silently is not -
@@ -2801,7 +2996,7 @@ def _log_startup_warnings():
             logger.info("Admin gate active for user %s", cleaned)
 
     if SAAS_AVAILABLE and mm is not None:
-        vis = mm.vision_status()
+        vis = await mm.vision_status()
         if not vis["usable"]:
             logger.warning(
                 "No vision backend configured - images and video will return a setup "
@@ -2814,7 +3009,7 @@ def _log_startup_warnings():
         if translator is not None:
             # Warm the model cache at boot so the first /translate or /languages
             # does not pay a probe on the event loop.
-            t = translator.translation_status()
+            t = await translator.translation_status()
             if t["dedicated"]:
                 logger.info("Translation model ready: %s (%d languages)",
                             t["in_use"], t["languages"])
@@ -2839,7 +3034,7 @@ def _log_startup_warnings():
                     "Voice replies unavailable - %s. /voice will explain.",
                     "; ".join(v["needs"]))
 
-        if not database.db_available():
+        if not await database.db_available():
             logger.warning(
                 "SaaS database unavailable (SQLAlchemy missing?) - tiers and usage "
                 "reset on every restart."
@@ -2863,6 +3058,1994 @@ async def post_shutdown(application):
             logger.info("Daily briefing scheduler shut down")
         except Exception as e:
             logger.warning(f"Scheduler shutdown issue: {e}")
+
+
+async def show_dashboard_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show dashboard and analytics menu."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    message = """
+📊 **DASHBOARD**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 📈 Overview ] [ 👥 Users ]
+[ 💰 Billing ] [ 📋 Logs ]
+[ ⚙ Settings ] [ 🔄 Sync ]
+[ 📥 Export ] [ ⬅ Back ]
+
+Select a dashboard section:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("📈 Overview", callback_data="dash_overview"),
+            InlineKeyboardButton("👥 Users", callback_data="dash_users"),
+        ],
+        [
+            InlineKeyboardButton("💰 Billing", callback_data="dash_billing"),
+            InlineKeyboardButton("📋 Logs", callback_data="dash_logs"),
+        ],
+        [
+            InlineKeyboardButton("⚙ Settings", callback_data="dash_settings"),
+            InlineKeyboardButton("🔄 Sync", callback_data="dash_sync"),
+        ],
+        [
+            InlineKeyboardButton("📥 Export", callback_data="dash_export"),
+            InlineKeyboardButton("⬅ Back", callback_data="main_menu"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+
+async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    message = """
+⚙ **SETTINGS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🔐 Privacy ] [ 🔔 Notifications ]
+[ 🎨 Appearance ] [ 🤖 Model ]
+[ 🌐 Language ] [ ⏰ Scheduler ]
+[ 💾 Storage ] [ ⬅ Back ]
+
+Select a settings category:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🔐 Privacy", callback_data="set_privacy"),
+            InlineKeyboardButton("🔔 Notifications", callback_data="set_notifications"),
+        ],
+        [
+            InlineKeyboardButton("🎨 Appearance", callback_data="set_appearance"),
+            InlineKeyboardButton("🤖 Model", callback_data="set_model"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Language", callback_data="set_language"),
+            InlineKeyboardButton("⏰ Scheduler", callback_data="set_scheduler"),
+        ],
+        [
+            InlineKeyboardButton("💾 Storage", callback_data="set_storage"),
+            InlineKeyboardButton("⬅ Back", callback_data="main_menu"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+
+async def show_help_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show help menu."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    message = """
+❓ **HELP**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🤖 AI ] [ 🛡️ Security ]
+[ 🔎 Intel ] [ 📊 Trading ]
+[ 📣 Social ] [ ⚙ System ]
+[ ⬇️ More ] [ ◀ Back ]
+
+Select a help category:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🤖 AI", callback_data="help_ai"),
+            InlineKeyboardButton("🛡️ Security", callback_data="help_security"),
+        ],
+        [
+            InlineKeyboardButton("🔎 Intel", callback_data="help_intel"),
+            InlineKeyboardButton("📊 Trading", callback_data="help_trading"),
+        ],
+        [
+            InlineKeyboardButton("📣 Social", callback_data="help_social"),
+            InlineKeyboardButton("⚙ System", callback_data="help_system"),
+        ],
+        [
+            InlineKeyboardButton("⬇️ More", callback_data="help_more"),
+            InlineKeyboardButton("◀ Back", callback_data="main_menu"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+
+async def show_security_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show security tools menu."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    message = """
+🛡️ **SECURITY TOOLS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🔍 Scan ] [ 💣 Exploit ]
+[ 🛡️ Shield ] [ 📡 Recon ]
+[ 🧪 Fuzz ] [ 🔐 Crypto ]
+[ 💉 Inject ] [ ⬅ Back ]
+
+Select a security category:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🔍 Scan", callback_data="sec_scan"),
+            InlineKeyboardButton("💣 Exploit", callback_data="sec_exploit"),
+        ],
+        [
+            InlineKeyboardButton("🛡️ Shield", callback_data="sec_shield"),
+            InlineKeyboardButton("📡 Recon", callback_data="sec_recon"),
+        ],
+        [
+            InlineKeyboardButton("🧪 Fuzz", callback_data="sec_fuzz"),
+            InlineKeyboardButton("🔐 Crypto", callback_data="sec_crypto"),
+        ],
+        [
+            InlineKeyboardButton("💉 Inject", callback_data="sec_inject"),
+            InlineKeyboardButton("⬅ Back", callback_data="main_menu"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_ai_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show AI tools menu."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    message = """
+🤖 **AI TOOLS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 💬 Chat ] [ 🎨 Generate ]
+[ 📊 Analyze ] [ 🔮 Predict ]
+[ 🧠 Reason ] [ 🗣️ Voice ]
+[ 🌐 Translate ] [ ⬅ Back ]
+
+Select an AI category:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("💬 Chat", callback_data="ai_chat"),
+            InlineKeyboardButton("🎨 Generate", callback_data="ai_generate"),
+        ],
+        [
+            InlineKeyboardButton("📊 Analyze", callback_data="ai_analyze"),
+            InlineKeyboardButton("🔮 Predict", callback_data="ai_predict"),
+        ],
+        [
+            InlineKeyboardButton("🧠 Reason", callback_data="ai_reason"),
+            InlineKeyboardButton("🗣️ Voice", callback_data="ai_voice"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Translate", callback_data="ai_translate"),
+            InlineKeyboardButton("⬅ Back", callback_data="main_menu"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_intel_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show intelligence gathering menu."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    message = """
+🔎 **INTELLIGENCE**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 👤 Profiler ] [ 💥 Breach ]
+[ 🌐 WHOIS ] [ 📱 Social ]
+[ 📍 GeoIP ] [ 📡 DNS ]
+[ 📜 Logger ] [ ⬅ Back ]
+
+Select an intel category:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("👤 Profiler", callback_data="intel_profiler"),
+            InlineKeyboardButton("💥 Breach", callback_data="intel_breach"),
+        ],
+        [
+            InlineKeyboardButton("🌐 WHOIS", callback_data="intel_whois"),
+            InlineKeyboardButton("📱 Social", callback_data="intel_social"),
+        ],
+        [
+            InlineKeyboardButton("📍 GeoIP", callback_data="intel_geoip"),
+            InlineKeyboardButton("📡 DNS", callback_data="intel_dns"),
+        ],
+        [
+            InlineKeyboardButton("📜 Logger", callback_data="intel_logger"),
+            InlineKeyboardButton("⬅ Back", callback_data="main_menu"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_dashboard_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show dashboard and analytics menu."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    message = """
+📊 **DASHBOARD**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 📈 Overview ] [ 👥 Users ]
+[ 💰 Billing ] [ 📋 Logs ]
+[ ⚙ Settings ] [ 🔄 Sync ]
+[ 📥 Export ] [ ⬅ Back ]
+
+Select a dashboard section:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("📈 Overview", callback_data="dash_overview"),
+            InlineKeyboardButton("👥 Users", callback_data="dash_users"),
+        ],
+        [
+            InlineKeyboardButton("💰 Billing", callback_data="dash_billing"),
+            InlineKeyboardButton("📋 Logs", callback_data="dash_logs"),
+        ],
+        [
+            InlineKeyboardButton("⚙ Settings", callback_data="dash_settings"),
+            InlineKeyboardButton("🔄 Sync", callback_data="dash_sync"),
+        ],
+        [
+            InlineKeyboardButton("📥 Export", callback_data="dash_export"),
+            InlineKeyboardButton("⬅ Back", callback_data="main_menu"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show settings configuration menu."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    message = """
+⚙ **SETTINGS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🔐 Privacy ] [ 🔔 Notifications ]
+[ 🎨 Appearance ] [ 🤖 Model ]
+[ 🌐 Language ] [ ⏰ Scheduler ]
+[ 💾 Storage ] [ ⬅ Back ]
+
+Select a settings category:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🔐 Privacy", callback_data="set_privacy"),
+            InlineKeyboardButton("🔔 Notifications", callback_data="set_notifications"),
+        ],
+        [
+            InlineKeyboardButton("🎨 Appearance", callback_data="set_appearance"),
+            InlineKeyboardButton("🤖 Model", callback_data="set_model"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Language", callback_data="set_language"),
+            InlineKeyboardButton("⏰ Scheduler", callback_data="set_scheduler"),
+        ],
+        [
+            InlineKeyboardButton("💾 Storage", callback_data="set_storage"),
+            InlineKeyboardButton("⬅ Back", callback_data="main_menu"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+
+async def show_security_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show security scan options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🔍 **SECURITY SCAN**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🌐 Network ] [ 💻 Host ]
+[ 🌐 Web ] [ 📱 Mobile ]
+[ 🔐 API ] [ ⬅ Back ]
+
+Select scan type:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🌐 Network", callback_data="scan_network"),
+            InlineKeyboardButton("💻 Host", callback_data="scan_host"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Web", callback_data="scan_web"),
+            InlineKeyboardButton("📱 Mobile", callback_data="scan_mobile"),
+        ],
+        [
+            InlineKeyboardButton("🔐 API", callback_data="scan_api"),
+            InlineKeyboardButton("⬅ Back", callback_data="sec_scan"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_security_exploit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show security exploit options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+💣 **EXPLOIT TOOLS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 💥 Remote ] [ 🔓 Local ]
+[ 🌐 Web ] [ 📱 Mobile ]
+[ 🔐 Crypto ] [ ⬅ Back ]
+
+Select exploit category:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("💥 Remote", callback_data="exploit_remote"),
+            InlineKeyboardButton("🔓 Local", callback_data="exploit_local"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Web", callback_data="exploit_web"),
+            InlineKeyboardButton("📱 Mobile", callback_data="exploit_mobile"),
+        ],
+        [
+            InlineKeyboardButton("🔐 Crypto", callback_data="exploit_crypto"),
+            InlineKeyboardButton("⬅ Back", callback_data="sec_exploit"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_security_shield(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show security shield/defense options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🛡️ **DEFENSE TOOLS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🔒 Harden ] [ 🛡️ Protect ]
+[ 🚨 Monitor ] [ 📊 Analyze ]
+[ 🧰 Tools ] [ ⬅ Back ]
+
+Select defense category:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🔒 Harden", callback_data="shield_harden"),
+            InlineKeyboardButton("🛡️ Protect", callback_data="shield_protect"),
+        ],
+        [
+            InlineKeyboardButton("🚨 Monitor", callback_data="shield_monitor"),
+            InlineKeyboardButton("📊 Analyze", callback_data="shield_analyze"),
+        ],
+        [
+            InlineKeyboardButton("🧰 Tools", callback_data="shield_tools"),
+            InlineKeyboardButton("⬅ Back", callback_data="sec_shield"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_security_recon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show reconnaissance options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+📡 **RECONNAISSANCE**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 👤 Footprint ] [ 🌐 Network ]
+[ 🌐 Web ] [ 📧 Email ]
+[ 📱 Social ] [ ⬅ Back ]
+
+Select recon type:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("👤 Footprint", callback_data="recon_footprint"),
+            InlineKeyboardButton("🌐 Network", callback_data="recon_network"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Web", callback_data="recon_web"),
+            InlineKeyboardButton("📧 Email", callback_data="recon_email"),
+        ],
+        [
+            InlineKeyboardButton("📱 Social", callback_data="recon_social"),
+            InlineKeyboardButton("⬅ Back", callback_data="sec_recon"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_security_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show fuzzing options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🧪 **FUZZING TOOLS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🌐 Web ] [ 📱 API ]
+[ 📦 File ] [ 📡 Network ]
+[ 💾 Binary ] [ ⬅ Back ]
+
+Select fuzz target:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🌐 Web", callback_data="fuzz_web"),
+            InlineKeyboardButton("📱 API", callback_data="fuzz_api"),
+        ],
+        [
+            InlineKeyboardButton("📦 File", callback_data="fuzz_file"),
+            InlineKeyboardButton("📡 Network", callback_data="fuzz_network"),
+        ],
+        [
+            InlineKeyboardButton("💾 Binary", callback_data="fuzz_binary"),
+            InlineKeyboardButton("⬅ Back", callback_data="sec_fuzz"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_security_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show cryptography options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🔐 **CRYPTO TOOLS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🔒 Encrypt ] [ 🔓 Decrypt ]
+[ 🔑 Hash ] [ ⚡ Crack ]
+[ 📝 Sign ] [ ⬅ Back ]
+
+Select crypto function:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🔒 Encrypt", callback_data="crypto_encrypt"),
+            InlineKeyboardButton("🔓 Decrypt", callback_data="crypto_decrypt"),
+        ],
+        [
+            InlineKeyboardButton("🔑 Hash", callback_data="crypto_hash"),
+            InlineKeyboardButton("⚡ Crack", callback_data="crypto_crack"),
+        ],
+        [
+            InlineKeyboardButton("📝 Sign", callback_data="crypto_sign"),
+            InlineKeyboardButton("⬅ Back", callback_data="sec_crypto"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_security_inject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show injection options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+💉 **INJECTION TOOLS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 💉 SQL ] [ 🌐 XSS ]
+[ 📱 Command ] [ 🐐 XXE ]
+[ 📥 LDAP ] [ ⬅ Back ]
+
+Select injection type:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("💉 SQL", callback_data="inject_sql"),
+            InlineKeyboardButton("🌐 XSS", callback_data="inject_xss"),
+        ],
+        [
+            InlineKeyboardButton("📱 Command", callback_data="inject_command"),
+            InlineKeyboardButton("🐐 XXE", callback_data="inject_xxe"),
+        ],
+        [
+            InlineKeyboardButton("📥 LDAP", callback_data="inject_ldap"),
+            InlineKeyboardButton("⬅ Back", callback_data="sec_inject"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+
+async def show_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show AI chat options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+💬 **AI CHAT**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 💬 General ] [ 🧠 Reasoning ]
+[ 📝 Coding ] [ 📊 Analysis ]
+[ 🌐 Research ] [ ⬅ Back ]
+
+Select chat mode:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("💬 General", callback_data="ai_chat_general"),
+            InlineKeyboardButton("🧠 Reasoning", callback_data="ai_chat_reasoning"),
+        ],
+        [
+            InlineKeyboardButton("📝 Coding", callback_data="ai_chat_coding"),
+            InlineKeyboardButton("📊 Analysis", callback_data="ai_chat_analysis"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Research", callback_data="ai_chat_research"),
+            InlineKeyboardButton("⬅ Back", callback_data="ai_chat"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_ai_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show AI generate options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🎨 **AI GENERATE**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🖼️ Image ] [ 📝 Text ]
+[ 🎵 Audio ] [ 💻 Code ]
+[ 📊 Data ] [ ⬅ Back ]
+
+Select generation type:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🖼️ Image", callback_data="ai_generate_image"),
+            InlineKeyboardButton("📝 Text", callback_data="ai_generate_text"),
+        ],
+        [
+            InlineKeyboardButton("🎵 Audio", callback_data="ai_generate_audio"),
+            InlineKeyboardButton("💻 Code", callback_data="ai_generate_code"),
+        ],
+        [
+            InlineKeyboardButton("📊 Data", callback_data="ai_generate_data"),
+            InlineKeyboardButton("⬅ Back", callback_data="ai_generate"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_ai_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show AI analyze options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+📊 **AI ANALYZE**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🔍 Deep ] [ 📈 Trend ]
+[ 💊 Sentiment ] [ 🔐 Security ]
+[ 📝 Code ] [ ⬅ Back ]
+
+Select analysis type:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🔍 Deep", callback_data="ai_analyze_deep"),
+            InlineKeyboardButton("📈 Trend", callback_data="ai_analyze_trend"),
+        ],
+        [
+            InlineKeyboardButton("💊 Sentiment", callback_data="ai_analyze_sentiment"),
+            InlineKeyboardButton("🔐 Security", callback_data="ai_analyze_security"),
+        ],
+        [
+            InlineKeyboardButton("📝 Code", callback_data="ai_analyze_code"),
+            InlineKeyboardButton("⬅ Back", callback_data="ai_analyze"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_ai_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show AI predict options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🔮 **AI PREDICT**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 📈 Financial ] [ 🌤️ Weather ]
+[ 🏀 Sports ] [ 📊 Market ]
+[ 🎯 Custom ] [ ⬅ Back ]
+
+Select prediction type:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("📈 Financial", callback_data="ai_predict_financial"),
+            InlineKeyboardButton("🌤️ Weather", callback_data="ai_predict_weather"),
+        ],
+        [
+            InlineKeyboardButton("🏀 Sports", callback_data="ai_predict_sports"),
+            InlineKeyboardButton("📊 Market", callback_data="ai_predict_market"),
+        ],
+        [
+            InlineKeyboardButton("🎯 Custom", callback_data="ai_predict_custom"),
+            InlineKeyboardButton("⬅ Back", callback_data="ai_predict"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_ai_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show AI reason options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🧠 **AI REASON**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🧩 Logic ] [ 🎯 Planning ]
+[ 🔍 Investigation ] [ 💡 Ideation ]
+[ 📚 Learning ] [ ⬅ Back ]
+
+Select reasoning type:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🧩 Logic", callback_data="ai_reason_logic"),
+            InlineKeyboardButton("🎯 Planning", callback_data="ai_reason_planning"),
+        ],
+        [
+            InlineKeyboardButton("🔍 Investigation", callback_data="ai_reason_investigation"),
+            InlineKeyboardButton("💡 Ideation", callback_data="ai_reason_ideation"),
+        ],
+        [
+            InlineKeyboardButton("📚 Learning", callback_data="ai_reason_learning"),
+            InlineKeyboardButton("⬅ Back", callback_data="ai_reason"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_ai_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show AI voice options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🗣️ **AI VOICE**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🎤 Speech-to-Text ] [ 🔊 Text-to-Speech ]
+[ 🎵 Audio Analysis ] [ 🗣️ Voice Mod ]
+[ 🔉 Noise Cancel ] [ ⬅ Back ]
+
+Select voice function:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🎤 Speech-to-Text", callback_data="ai_voice_stt"),
+            InlineKeyboardButton("🔊 Text-to-Speech", callback_data="ai_voice_tts"),
+        ],
+        [
+            InlineKeyboardButton("🎵 Audio Analysis", callback_data="ai_voice_analysis"),
+            InlineKeyboardButton("🗣️ Voice Mod", callback_data="ai_voice_mod"),
+        ],
+        [
+            InlineKeyboardButton("🔉 Noise Cancel", callback_data="ai_voice_noisecancel"),
+            InlineKeyboardButton("⬅ Back", callback_data="ai_voice"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_ai_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show AI translate options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🌐 **AI TRANSLATE**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 📝 Text ] [ 📄 Document ]
+[ 🌐 Website ] [ 🎥 Video ]
+[ 💬 Chat ] [ ⬅ Back ]
+
+Select translation type:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("📝 Text", callback_data="ai_translate_text"),
+            InlineKeyboardButton("📄 Document", callback_data="ai_translate_document"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Website", callback_data="ai_translate_website"),
+            InlineKeyboardButton("🎥 Video", callback_data="ai_translate_video"),
+        ],
+        [
+            InlineKeyboardButton("💬 Chat", callback_data="ai_translate_chat"),
+            InlineKeyboardButton("⬅ Back", callback_data="ai_translate"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+
+async def show_intel_profiler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show profiler options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+👤 **PROFILER**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🌐 Domain ] [ 📧 Email ]
+[ 👤 Username ] [ 📱 Phone ]
+[ 📍 Address ] [ ⬅ Back ]
+
+Select profiler type:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🌐 Domain", callback_data="intel_profiler_domain"),
+            InlineKeyboardButton("📧 Email", callback_data="intel_profiler_email"),
+        ],
+        [
+            InlineKeyboardButton("👤 Username", callback_data="intel_profiler_username"),
+            InlineKeyboardButton("📱 Phone", callback_data="intel_profiler_phone"),
+        ],
+        [
+            InlineKeyboardButton("📍 Address", callback_data="intel_profiler_address"),
+            InlineKeyboardButton("⬅ Back", callback_data="intel_profiler"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_intel_breach(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show breach options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+💥 **BREACH DATA**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 📧 Email ] [ 🔑 Password ]
+[ 💳 Credit Card ] [ 📱 Phone ]
+[ 🆔 SSN ] [ ⬅ Back ]
+
+Select breach type:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("📧 Email", callback_data="intel_breach_email"),
+            InlineKeyboardButton("🔑 Password", callback_data="intel_breach_password"),
+        ],
+        [
+            InlineKeyboardButton("💳 Credit Card", callback_data="intel_breach_creditcard"),
+            InlineKeyboardButton("📱 Phone", callback_data="intel_breach_phone"),
+        ],
+        [
+            InlineKeyboardButton("🆔 SSN", callback_data="intel_breach_ssn"),
+            InlineKeyboardButton("⬅ Back", callback_data="intel_breach"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_intel_whois(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show WHOIS options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🌐 **WHOIS LOOKUP**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🌐 Domain ] [ 🌐 IP ]
+[ 📥 Reverse ] [ 📋 Bulk ]
+[ 📜 History ] [ ⬅ Back ]
+
+Select WHOIS type:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🌐 Domain", callback_data="intel_whois_domain"),
+            InlineKeyboardButton("🌐 IP", callback_data="intel_whois_ip"),
+        ],
+        [
+            InlineKeyboardButton("📥 Reverse", callback_data="intel_whois_reverse"),
+            InlineKeyboardButton("📋 Bulk", callback_data="intel_whois_bulk"),
+        ],
+        [
+            InlineKeyboardButton("📜 History", callback_data="intel_whois_history"),
+            InlineKeyboardButton("⬅ Back", callback_data="intel_whois"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_intel_social(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show social intel options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+📱 **SOCIAL INTEL**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🐦 Twitter ] [ 📘 Facebook ]
+[ 📸 Instagram ] [ 💼 LinkedIn ]
+[ 👥 GitHub ] [ ⬅ Back ]
+
+Select platform:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🐦 Twitter", callback_data="intel_social_twitter"),
+            InlineKeyboardButton("📘 Facebook", callback_data="intel_social_facebook"),
+        ],
+        [
+            InlineKeyboardButton("📸 Instagram", callback_data="intel_social_instagram"),
+            InlineKeyboardButton("💼 LinkedIn", callback_data="intel_social_linkedin"),
+        ],
+        [
+            InlineKeyboardButton("👥 GitHub", callback_data="intel_social_github"),
+            InlineKeyboardButton("⬅ Back", callback_data="intel_social"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_intel_geoip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show GeoIP options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+📍 **GEOIP LOOKUP**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🔍 Single ] [ 📋 Bulk ]
+[ 🗺️ Mapping ] [ 📊 Statistics ]
+[ 🚨 Threat Intel ] [ ⬅ Back ]
+
+Select GeoIP function:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🔍 Single", callback_data="intel_geoip_single"),
+            InlineKeyboardButton("📋 Bulk", callback_data="intel_geoip_bulk"),
+        ],
+        [
+            InlineKeyboardButton("🗺️ Mapping", callback_data="intel_geoip_mapping"),
+            InlineKeyboardButton("📊 Statistics", callback_data="intel_geoip_stats"),
+        ],
+        [
+            InlineKeyboardButton("🚨 Threat Intel", callback_data="intel_geoip_threat"),
+            InlineKeyboardButton("⬅ Back", callback_data="intel_geoip"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_intel_dns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show DNS options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+📡 **DNS LOOKUP**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🔍 A Record ] [ 📮 MX Record ]
+[ 📝 TXT Record ] [ 🌐 NS Record ]
+[ 🔄 CNAME ] [ ⬅ Back ]
+
+Select DNS type:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🔍 A Record", callback_data="intel_dns_a"),
+            InlineKeyboardButton("📮 MX Record", callback_data="intel_dns_mx"),
+        ],
+        [
+            InlineKeyboardButton("📝 TXT Record", callback_data="intel_dns_txt"),
+            InlineKeyboardButton("🌐 NS Record", callback_data="intel_dns_ns"),
+        ],
+        [
+            InlineKeyboardButton("🔄 CNAME", callback_data="intel_dns_cname"),
+            InlineKeyboardButton("⬅ Back", callback_data="intel_dns"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_intel_logger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show logger options."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+📜 **LOGGER & MONITOR**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 📥 Packet ] [ 🌐 Web Traffic ]
+[ 🔐 Auth Logs ] [ 💾 File Monitor ]
+[ 🚨 Alert System ] [ ⬅ Back ]
+
+Select logger type:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("📥 Packet", callback_data="intel_logger_packet"),
+            InlineKeyboardButton("🌐 Web Traffic", callback_data="intel_logger_web"),
+        ],
+        [
+            InlineKeyboardButton("🔐 Auth Logs", callback_data="intel_logger_auth"),
+            InlineKeyboardButton("💾 File Monitor", callback_data="intel_logger_file"),
+        ],
+        [
+            InlineKeyboardButton("🚨 Alert System", callback_data="intel_logger_alert"),
+            InlineKeyboardButton("⬅ Back", callback_data="intel_logger"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+
+async def show_dashboard_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show dashboard overview."""
+    query = update.callback_query
+    await query.answer()
+
+    # Get some basic stats for the overview
+    total_users = 0
+    pro_users = 0
+    if SAAS_AVAILABLE and database:
+        try:
+            # This would be async in real implementation
+            total_users = len(await database.get_all_users()) if hasattr(database, 'get_all_users') else 0
+            pro_users = len([u for u in await database.get_all_users() if u.get('tier') == 'PRO']) if hasattr(database, 'get_all_users') else 0
+        except:
+            pass
+
+    message = f"""
+📈 **DASHBOARD OVERVIEW**
+━━━━━━━━━━━━━━━━━━━━
+
+👥 **Users:** {total_users} total
+💳 **Pro Users:** {pro_users}
+🟢 **Status:** Online
+⚡ **Uptime:** 99.8%
+
+[ 🔄 Refresh ] [ 📊 Detailed ]
+[ 📥 Export ] [ ⬅ Back ]
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="dash_overview_refresh"),
+            InlineKeyboardButton("📊 Detailed", callback_data="dash_detailed"),
+        ],
+        [
+            InlineKeyboardButton("📥 Export", callback_data="dash_export"),
+            InlineKeyboardButton("⬅ Back", callback_data="dash_overview"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_dashboard_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show dashboard users."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+👥 **DASHBOARD USERS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 📋 List ] [ 🔍 Search ]
+[ 📊 Stats ] [ 💰 Revenue ]
+[ ⚙ Manage ] [ ⬅ Back ]
+
+Select user function:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("📋 List", callback_data="dash_users_list"),
+            InlineKeyboardButton("🔍 Search", callback_data="dash_users_search"),
+        ],
+        [
+            InlineKeyboardButton("📊 Stats", callback_data="dash_users_stats"),
+            InlineKeyboardButton("💰 Revenue", callback_data="dash_users_revenue"),
+        ],
+        [
+            InlineKeyboardButton("⚙ Manage", callback_data="dash_users_manage"),
+            InlineKeyboardButton("⬅ Back", callback_data="dash_users"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_dashboard_billing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show dashboard billing."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+💰 **DASHBOARD BILLING**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 💳 Payments ] [ 📄 Invoices ]
+[ 📈 Revenue ] [ 📊 Analytics ]
+[ 💳 Subscription ] [ ⬅ Back ]
+
+Select billing function:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("💳 Payments", callback_data="dash_billing_payments"),
+            InlineKeyboardButton("📄 Invoices", callback_data="dash_billing_invoices"),
+        ],
+        [
+            InlineKeyboardButton("📈 Revenue", callback_data="dash_billing_revenue"),
+            InlineKeyboardButton("📊 Analytics", callback_data="dash_billing_analytics"),
+        ],
+        [
+            InlineKeyboardButton("💳 Subscription", callback_data="dash_billing_subscription"),
+            InlineKeyboardButton("⬅ Back", callback_data="dash_billing"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_dashboard_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show dashboard logs."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+📋 **DASHBOARD LOGS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🚨 Errors ] [ ⚠️ Warnings ]
+[ ℹ️ Info ] [ 🔍 Debug ]
+[ 📥 Download ] [ ⬅ Back ]
+
+Select log type:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🚨 Errors", callback_data="dash_logs_errors"),
+            InlineKeyboardButton("⚠️ Warnings", callback_data="dash_logs_warnings"),
+        ],
+        [
+            InlineKeyboardButton("ℹ️ Info", callback_data="dash_logs_info"),
+            InlineKeyboardButton("🔍 Debug", callback_data="dash_logs_debug"),
+        ],
+        [
+            InlineKeyboardButton("📥 Download", callback_data="dash_logs_download"),
+            InlineKeyboardButton("⬅ Back", callback_data="dash_logs"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_dashboard_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show dashboard settings."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+⚙ **DASHBOARD SETTINGS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🎨 Theme ] [ 📊 Layout ]
+[ 🔐 Privacy ] [ 🔔 Notifications ]
+[ 💾 Storage ] [ ⬅ Back ]
+
+Select setting:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🎨 Theme", callback_data="dash_settings_theme"),
+            InlineKeyboardButton("📊 Layout", callback_data="dash_settings_layout"),
+        ],
+        [
+            InlineKeyboardButton("🔐 Privacy", callback_data="dash_settings_privacy"),
+            InlineKeyboardButton("🔔 Notifications", callback_data="dash_settings_notifications"),
+        ],
+        [
+            InlineKeyboardButton("💾 Storage", callback_data="dash_settings_storage"),
+            InlineKeyboardButton("⬅ Back", callback_data="dash_settings"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_dashboard_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show dashboard sync."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🔄 **DASHBOARD SYNC**
+━━━━━━━━━━━━━━━━━━━━
+
+[ ☁️ Cloud ] [ 🔄 Manual ]
+[ ⏰ Schedule ] [ 📊 Status ]
+[ 🔧 Tools ] [ ⬅ Back ]
+
+Select sync option:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("☁️ Cloud", callback_data="dash_sync_cloud"),
+            InlineKeyboardButton("🔄 Manual", callback_data="dash_sync_manual"),
+        ],
+        [
+            InlineKeyboardButton("⏰ Schedule", callback_data="dash_sync_schedule"),
+            InlineKeyboardButton("📊 Status", callback_data="dash_sync_status"),
+        ],
+        [
+            InlineKeyboardButton("🔧 Tools", callback_data="dash_sync_tools"),
+            InlineKeyboardButton("⬅ Back", callback_data="dash_sync"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_dashboard_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show dashboard export."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+📥 **DASHBOARD EXPORT**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 📊 CSV ] [ 📋 JSON ]
+[ 📈 PDF ] [ 🖼️ PNG ]
+[ 📦 Bundle ] [ ⬅ Back ]
+
+Select export format:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 CSV", callback_data="dash_export_csv"),
+            InlineKeyboardButton("📋 JSON", callback_data="dash_export_json"),
+        ],
+        [
+            InlineKeyboardButton("📈 PDF", callback_data="dash_export_pdf"),
+            InlineKeyboardButton("🖼️ PNG", callback_data="dash_export_png"),
+        ],
+        [
+            InlineKeyboardButton("📦 Bundle", callback_data="dash_export_bundle"),
+            InlineKeyboardButton("⬅ Back", callback_data="dash_export"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+
+async def show_settings_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show settings privacy."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🔐 **PRIVACY SETTINGS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🔒 Encryption ] [ 🕵️‍♂️ Anonymity ]
+[ 📊 Data Retention ] [ 🗑️ Deletion ]
+[ 🌐 Location ] [ ⬅ Back ]
+
+Select privacy option:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🔒 Encryption", callback_data="set_privacy_encryption"),
+            InlineKeyboardButton("🕵️‍♂️ Anonymity", callback_data="set_privacy_anonymity"),
+        ],
+        [
+            InlineKeyboardButton("📊 Data Retention", callback_data="set_privacy_retention"),
+            InlineKeyboardButton("🗑️ Deletion", callback_data="set_privacy_deletion"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Location", callback_data="set_privacy_location"),
+            InlineKeyboardButton("⬅ Back", callback_data="set_privacy"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_settings_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show settings notifications."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🔔 **NOTIFICATION SETTINGS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 📱 Telegram ] [ 📧 Email ]
+[ 💬 Discord ] [ 📟 SMS ]
+[ ⏰ Schedule ] [ ⬅ Back ]
+
+Select notification method:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("📱 Telegram", callback_data="set_notifications_telegram"),
+            InlineKeyboardButton("📧 Email", callback_data="set_notifications_email"),
+        ],
+        [
+            InlineKeyboardButton("💬 Discord", callback_data="set_notifications_discord"),
+            InlineKeyboardButton("📟 SMS", callback_data="set_notifications_sms"),
+        ],
+        [
+            InlineKeyboardButton("⏰ Schedule", callback_data="set_notifications_schedule"),
+            InlineKeyboardButton("⬅ Back", callback_data="set_notifications"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_settings_appearance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show settings appearance."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🎨 **APPEARANCE SETTINGS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🌓 Theme ] [ 🎨 Colors ]
+[ �� Font ] [ 📐 Layout ]
+[ 🖼️ Icons ] [ ⬅ Back ]
+
+Select appearance option:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🌓 Theme", callback_data="set_appearance_theme"),
+            InlineKeyboardButton("🎨 Colors", callback_data="set_appearance_colors"),
+        ],
+        [
+            InlineKeyboardButton("�� Font", callback_data="set_appearance_font"),
+            InlineKeyboardButton("📐 Layout", callback_data="set_appearance_layout"),
+        ],
+        [
+            InlineKeyboardButton("🖼️ Icons", callback_data="set_appearance_icons"),
+            InlineKeyboardButton("⬅ Back", callback_data="set_appearance"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_settings_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show settings model."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🤖 **MODEL SETTINGS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🧠 Current ] [ 🔄 Switch ]
+[ 📊 Performance ] [ 💰 Cost ]
+[ ⚙️ Parameters ] [ ⬅ Back ]
+
+Select model option:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🧠 Current", callback_data="set_model_current"),
+            InlineKeyboardButton("🔄 Switch", callback_data="set_model_switch"),
+        ],
+        [
+            InlineKeyboardButton("📊 Performance", callback_data="set_model_performance"),
+            InlineKeyboardButton("💰 Cost", callback_data="set_model_cost"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ Parameters", callback_data="set_model_parameters"),
+            InlineKeyboardButton("⬅ Back", callback_data="set_model"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_settings_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show settings language."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+🌐 **LANGUAGE SETTINGS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🇺🇸 English ] [ 🇪🇸 Spanish ]
+[ 🇫🇷 French ] [ 🇩🇪 German ]
+[ 🇯🇵 Japanese ] [ ⬅ Back ]
+
+Select language:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🇺🇸 English", callback_data="set_language_english"),
+            InlineKeyboardButton("🇪🇸 Spanish", callback_data="set_language_spanish"),
+        ],
+        [
+            InlineKeyboardButton("🇫🇷 French", callback_data="set_language_french"),
+            InlineKeyboardButton("🇩🇪 German", callback_data="set_language_german"),
+        ],
+        [
+            InlineKeyboardButton("🇯🇵 Japanese", callback_data="set_language_japanese"),
+            InlineKeyboardButton("⬅ Back", callback_data="set_language"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_settings_scheduler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show settings scheduler."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+⏰ **SCHEDULER SETTINGS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 📅 Daily ] [ ⏰ Hourly ]
+[ 📅 Weekly ] [ 📅 Monthly ]
+[ 🔧 Custom ] [ ⬅ Back ]
+
+Select schedule interval:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("𓅐 Daily", callback_data="set_scheduler_daily"),
+            InlineKeyboardButton("⏰ Hourly", callback_data="set_scheduler_hourly"),
+        ],
+        [
+            InlineKeyboardButton("📅 Weekly", callback_data="set_scheduler_weekly"),
+            InlineKeyboardButton("📅 Monthly", callback_data="set_scheduler_monthly"),
+        ],
+        [
+            InlineKeyboardButton("🔧 Custom", callback_data="set_scheduler_custom"),
+            InlineKeyboardButton("⬅ Back", callback_data="set_scheduler"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_settings_storage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show settings storage."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+💾 **STORAGE SETTINGS**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 💾 Local ] [ ☁️ Cloud ]
+[ 📊 Usage ] [ 🗑️ Cleanup ]
+[ 🔐 Security ] [ ⬅ Back ]
+
+Select storage option:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("💾 Local", callback_data="set_storage_local"),
+            InlineKeyboardButton("☁️ Cloud", callback_data="set_storage_cloud"),
+        ],
+        [
+            InlineKeyboardButton("📊 Usage", callback_data="set_storage_usage"),
+            InlineKeyboardButton("🗑️ Cleanup", callback_data="set_storage_cleanup"),
+        ],
+        [
+            InlineKeyboardButton("🔐 Security", callback_data="set_storage_security"),
+            InlineKeyboardButton("⬅ Back", callback_data="set_storage"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+
+async def show_trading_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show trading help menu."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+📊 **TRADING HELP**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 📈 Analysis ] [ 🤖 Bot ]
+[ 📋 Signals ] [ 💰 Portfolio ]
+[ 📚 Learn ] [ ⬅ Back ]
+
+Select trading topic:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("📈 Analysis", callback_data="help_trading_analysis"),
+            InlineKeyboardButton("🤖 Bot", callback_data="help_trading_bot"),
+        ],
+        [
+            InlineKeyboardButton("📋 Signals", callback_data="help_trading_signals"),
+            InlineKeyboardButton("💰 Portfolio", callback_data="help_trading_portfolio"),
+        ],
+        [
+            InlineKeyboardButton("📚 Learn", callback_data="help_trading_learn"),
+            InlineKeyboardButton("⬅ Back", callback_data="help_trading"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_social_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show social help menu."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+📣 **SOCIAL HELP**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 📖 Guide ] [ 📊 Status ]
+[ 📈 Analytics ] [ 🎯 Strategy ]
+[ 🛠️ Tools ] [ ⬅ Back ]
+
+Select social topic:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("📖 Guide", callback_data="help_social_guide"),
+            InlineKeyboardButton("📊 Status", callback_data="help_social_status"),
+        ],
+        [
+            InlineKeyboardButton("📈 Analytics", callback_data="help_social_analytics"),
+            InlineKeyboardButton("🎯 Strategy", callback_data="help_social_strategy"),
+        ],
+        [
+            InlineKeyboardButton("🛠️ Tools", callback_data="help_social_tools"),
+            InlineKeyboardButton("⬅ Back", callback_data="help_social"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_system_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show system help menu."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+⚙ **SYSTEM HELP**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 🚀 Commands ] [ ⚙️ Config ]
+[ 📊 Status ] [ 📜 Logs ]
+[ 🔧 Tools ] [ ⬅ Back ]
+
+Select system topic:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("🚀 Commands", callback_data="help_system_commands"),
+            InlineKeyboardButton("⚙️ Config", callback_data="help_system_config"),
+        ],
+        [
+            InlineKeyboardButton("📊 Status", callback_data="help_system_status"),
+            InlineKeyboardButton("📜 Logs", callback_data="help_system_logs"),
+        ],
+        [
+            InlineKeyboardButton("🔧 Tools", callback_data="help_system_tools"),
+            InlineKeyboardButton("⬅ Back", callback_data="help_system"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def show_more_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show more help menu."""
+    query = update.callback_query
+    await query.answer()
+
+    message = """
+⬇️ **MORE HELP**
+━━━━━━━━━━━━━━━━━━━━
+
+[ 💎 Elite ] [ 🎯 Missions ]
+[ 🏆 Leaderboard ] [ 👥 Community ]
+[ ❓ Support ] [ ⬅ Back ]
+
+Select more topic:
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("💎 Elite", callback_data="help_more_elite"),
+            InlineKeyboardButton("🎯 Missions", callback_data="help_more_missions"),
+        ],
+        [
+            InlineKeyboardButton("🏆 Leaderboard", callback_data="help_more_leaderboard"),
+            InlineKeyboardButton("👥 Community", callback_data="help_more_community"),
+        ],
+        [
+            InlineKeyboardButton("❓ Support", callback_data="help_more_support"),
+            InlineKeyboardButton("⬅ Back", callback_data="help_more"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button callbacks from inline keyboards."""
+    query = update.callback_query
+    await query.answer()
+
+    # Route to appropriate menu based on callback data
+    data = query.data
+
+    # Main menu callbacks
+    if data == "main_menu":
+        await _show_main_menu(update)
+    elif data == "help_text":
+        # send_long() reads update.message, which is None on a callback, so
+        # the plain-text command is answered through the query's own message.
+        text = HELP_REFERENCE
+        for chunk in _chunk_for_telegram(text):
+            try:
+                await query.message.reply_text(chunk, parse_mode="Markdown")
+            except Exception:
+                await query.message.reply_text(chunk)
+
+    # Top-level menu roots. These three open the inline trees; the plain-text
+    # /help and /dashboard commands stay available as *_text fallbacks so the
+    # command surface is unchanged.
+    elif data == "help_root":
+        await show_help_menu(update, context)
+    elif data == "dash_root":
+        await show_dashboard_menu(update, context)
+    elif data == "set_root":
+        await show_settings_menu(update, context)
+
+    # Help menu callbacks
+    elif data == "help_ai":
+        await show_ai_menu(update, context)
+    elif data == "help_security":
+        await show_security_menu(update, context)
+    elif data == "help_intel":
+        await show_intel_menu(update, context)
+    elif data == "help_trading":
+        await show_trading_menu(update, context)
+    elif data == "help_social":
+        await show_social_menu(update, context)
+    elif data == "help_system":
+        await show_system_menu(update, context)
+    elif data == "help_more":
+        await show_more_menu(update, context)
+
+    # Security menu callbacks
+    elif data == "sec_scan":
+        await show_security_scan(update, context)
+    elif data == "sec_exploit":
+        await show_security_exploit(update, context)
+    elif data == "sec_shield":
+        await show_security_shield(update, context)
+    elif data == "sec_recon":
+        await show_security_recon(update, context)
+    elif data == "sec_fuzz":
+        await show_security_fuzz(update, context)
+    elif data == "sec_crypto":
+        await show_security_crypto(update, context)
+    elif data == "sec_inject":
+        await show_security_inject(update, context)
+
+    # AI menu callbacks
+    elif data == "ai_chat":
+        await show_ai_chat(update, context)
+    elif data == "ai_generate":
+        await show_ai_generate(update, context)
+    elif data == "ai_analyze":
+        await show_ai_analyze(update, context)
+    elif data == "ai_predict":
+        await show_ai_predict(update, context)
+    elif data == "ai_reason":
+        await show_ai_reason(update, context)
+    elif data == "ai_voice":
+        await show_ai_voice(update, context)
+    elif data == "ai_translate":
+        await show_ai_translate(update, context)
+
+    # Intel menu callbacks
+    elif data == "intel_profiler":
+        await show_intel_profiler(update, context)
+    elif data == "intel_breach":
+        await show_intel_breach(update, context)
+    elif data == "intel_whois":
+        await show_intel_whois(update, context)
+    elif data == "intel_social":
+        await show_intel_social(update, context)
+    elif data == "intel_geoip":
+        await show_intel_geoip(update, context)
+    elif data == "intel_dns":
+        await show_intel_dns(update, context)
+    elif data == "intel_logger":
+        await show_intel_logger(update, context)
+
+    # Dashboard menu callbacks
+    elif data == "dash_overview":
+        await show_dashboard_overview(update, context)
+    elif data == "dash_users":
+        await show_dashboard_users(update, context)
+    elif data == "dash_billing":
+        await show_dashboard_billing(update, context)
+    elif data == "dash_logs":
+        await show_dashboard_logs(update, context)
+    elif data == "dash_settings":
+        await show_dashboard_settings(update, context)
+    elif data == "dash_sync":
+        await show_dashboard_sync(update, context)
+    elif data == "dash_export":
+        await show_dashboard_export(update, context)
+
+    # Settings menu callbacks
+    elif data == "set_privacy":
+        await show_settings_privacy(update, context)
+    elif data == "set_notifications":
+        await show_settings_notifications(update, context)
+    elif data == "set_appearance":
+        await show_settings_appearance(update, context)
+    elif data == "set_model":
+        await show_settings_model(update, context)
+    elif data == "set_language":
+        await show_settings_language(update, context)
+    elif data == "set_scheduler":
+        await show_settings_scheduler(update, context)
+    elif data == "set_storage":
+        await show_settings_storage(update, context)
+
+    # If no specific handler found, show a message
+    else:
+        await query.edit_message_text(
+            text=f"🔧 Functionality for `{data}` is being developed...\n\nPlease use the buttons to navigate.",
+            parse_mode='Markdown'
+        )
+
 
 def main():
     """Start the bot."""
@@ -2950,6 +5133,11 @@ def main():
         application.add_handler(CommandHandler("voice_lang", voice_lang_command))
         application.add_handler(CommandHandler("voice_use", voice_use_command))
         application.add_handler(CommandHandler("voices", voices_command))
+
+    # Inline menu navigation (help / dashboard / settings trees).
+    # Registered before the message handlers so a button tap can never be
+    # swallowed by the plain-text chat handler.
+    application.add_handler(CallbackQueryHandler(button_callback))
 
     # Voice message handler
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))

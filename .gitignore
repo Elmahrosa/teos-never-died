@@ -18,6 +18,8 @@ Thumbs.db
 .raven_sessions/
 .raven_knowledge/
 raven_export_*.md
+# Conversation exports can contain real user chat content, not just summaries.
+raven_export_*.json
 
 # Trading state (paper balances + trade log)
 raven_portfolio.json
@@ -36,6 +38,24 @@ temp_voice_*.wav
 blobs/
 manifests/
 metadata/
+
+# Hand-rolled backup and splice scratch. A previous session left *.bak*,
+# *.backup and sub_functions*.txt in the tree; the *.txt copies were partial
+# and the splice that consumed them corrupted telegram_bot.py. Edit files in
+# place and commit - do not stage these.
+*.bak
+*.bak2
+*.backup
+sub_functions*.txt
+menu_functions.txt
+button_callback.txt
+help_menu.txt
+workflow_phase5*.js
+
+# Scratch produced by running a module directly. The perf harness in
+# diagnostics.py writes these next to the code it probes.
+_audit_*.py
+dbg.py
 
 # Test scratch. The suite points DATABASE_URL at a temp sqlite file, but a
 # stray run against the default path would create this in the repo root.

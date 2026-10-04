@@ -23,7 +23,6 @@ import asyncio
 import datetime
 import logging
 import os
-import threading
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("raven.db")
@@ -37,9 +36,9 @@ TIER_PRO = "pro"
 TIER_ENTERPRISE = "enterprise"
 VALID_TIERS = (TIER_FREE, TIER_PRO, TIER_ENTERPRISE)
 
-_lock = threading.RLock()
-_engine = None
-_SessionFactory = None
+_lock = asyncio.Lock()
+_async_engine: Optional[AsyncEngine] = None
+_AsyncSessionFactory: Optional[sessionmaker] = None
 _memory: Dict[str, Dict[str, Dict[str, Any]]] = {"users": {}, "daily": {}}
 
 
@@ -63,10 +62,12 @@ try:
         String,
         Text,
         UniqueConstraint,
+        select,
         create_engine,
         inspect,
         text as _sql_text,
     )
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
     from sqlalchemy.orm import declarative_base, sessionmaker  # type: ignore
 
     _HAVE_SQLALCHEMY = True
@@ -101,6 +102,8 @@ if _HAVE_SQLALCHEMY:
         translate_lang = Column(String(16), default="", nullable=False)
         created_at = Column(DateTime, default=_utcnow)
         last_seen = Column(DateTime, default=_utcnow)
+        daily_api_calls = Column(Integer, default=0, nullable=False)
+        last_reset = Column(DateTime, nullable=True)
 
     class Subscription(Base):
         """Billing history. `expires_at` is NULL for a lifetime/manual grant."""
@@ -114,6 +117,7 @@ if _HAVE_SQLALCHEMY:
         reference = Column(String(128), default="")
         created_at = Column(DateTime, default=_utcnow)
         expires_at = Column(DateTime, nullable=True)
+        tier = Column(String(32), nullable=True)
 
     class DailyUsage(Base):
         """Per-user, per-day counters backing the tier limits."""
@@ -132,28 +136,59 @@ if _HAVE_SQLALCHEMY:
 # ---------------------------------------------------------------------------
 # Engine management
 # ---------------------------------------------------------------------------
-def init_db() -> bool:
+def _async_url(url: str) -> str:
+    """Point a sync SQLAlchemy URL at its async driver.
+
+    create_async_engine() rejects a bare `sqlite://` or `postgresql://` URL
+    with "The asyncio extension requires an async driver to be used", and
+    init_db() swallows that into its in-memory fallback. `DATABASE_URL=
+    sqlite:///raven.db` is the most natural thing to write, so accept it
+    rather than silently persisting nothing.
+    """
+    if url.startswith("sqlite://"):
+        return "sqlite+aiosqlite://" + url[len("sqlite://"):]
+    if url.startswith("postgresql://"):
+        return "postgresql+asyncpg://" + url[len("postgresql://"):]
+    return url
+
+
+async def init_db() -> bool:
     """Create tables if needed. Returns True when a real DB is available."""
-    global _engine, _SessionFactory
+    global _async_engine, _AsyncSessionFactory
     if not _HAVE_SQLALCHEMY:
         return False
-    if _SessionFactory is not None:
+    if _AsyncSessionFactory is not None:
         return True
-    with _lock:
-        if _SessionFactory is not None:
+    async with _lock:
+        if _AsyncSessionFactory is not None:
             return True
         try:
-            url = DATABASE_URL or f"sqlite:///{DEFAULT_SQLITE}"
-            kwargs = {"future": True}
-            if url.startswith("sqlite"):
-                # Required because handlers touch the session from thread pool
-                # workers, which are not the same thread that created it.
-                kwargs["connect_args"] = {"check_same_thread": False}
-            engine = create_engine(url, **kwargs)
-            Base.metadata.create_all(engine)
-            _migrate_columns(engine)
-            _engine = engine
-            _SessionFactory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+            url = _async_url(DATABASE_URL or f"sqlite+aiosqlite:///{DEFAULT_SQLITE}")
+            kwargs = {"echo": False}
+            # SQLite is only pooled when it is backed by a file. For an
+            # in-memory URL SQLAlchemy selects StaticPool (aiosqlite) or
+            # SingletonThreadPool (pysqlite), and neither accepts pool_size or
+            # max_overflow - it raises TypeError. Passing them anyway made
+            # init_db() fall back to the in-memory dict store, so a
+            # DATABASE_URL of sqlite+aiosqlite:///:memory: silently lost all
+            # subscription and usage data on every restart.
+            in_memory = (":memory:" in url or "mode=memory" in url)
+            if url.startswith("sqlite") and not in_memory:
+                kwargs["pool_pre_ping"] = True   # connection health check
+                kwargs["pool_recycle"] = 300     # recycle every 5 minutes
+                kwargs["pool_size"] = 5
+                kwargs["max_overflow"] = 10
+            else:
+                # Non-SQLite backends (Postgres) pool fine; SQLite memory
+                # pools are fixed by the dialect.
+                kwargs["pool_pre_ping"] = True
+            _async_engine = create_async_engine(url, **kwargs)
+            async with _async_engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+                await _run_migrate_columns(_async_engine)
+            _AsyncSessionFactory = sessionmaker(
+                bind=_async_engine, class_=AsyncSession, expire_on_commit=False
+            )
             logger.info("SaaS database ready (%s)", url.split("://")[0])
             return True
         except Exception:
@@ -161,8 +196,8 @@ def init_db() -> bool:
             return False
 
 
-def db_available() -> bool:
-    return init_db()
+async def db_available() -> bool:
+    return await init_db()
 
 
 # Columns added after the first release. `create_all` never alters an existing
@@ -175,15 +210,21 @@ _ADDED_COLUMNS = (
     ("users", "voice_gender", "VARCHAR(16) NOT NULL DEFAULT 'female'"),
     ("users", "voice_name", "VARCHAR(64) NOT NULL DEFAULT ''"),
     ("users", "translate_lang", "VARCHAR(16) NOT NULL DEFAULT ''"),
+    ("users", "daily_api_calls", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "last_reset", "TIMESTAMP NULL"),
+    ("subscriptions", "tier", "VARCHAR(32) NULL"),
 )
 
 
-def _migrate_columns(engine) -> None:
+async def _run_migrate_columns(async_engine: AsyncEngine) -> None:
     """Add any missing columns. Never drops or rewrites data."""
     try:
-        insp = inspect(engine)
+        # Create a synchronous engine for inspection and migration
+        url = str(async_engine.url).replace("sqlite+aiosqlite://", "sqlite://").replace("postgresql+asyncpg://", "postgresql://")
+        sync_engine = create_engine(url)
+        insp = inspect(sync_engine)
         tables = set(insp.get_table_names())
-        with engine.begin() as conn:
+        with sync_engine.begin() as conn:
             for table, column, ddl in _ADDED_COLUMNS:
                 if table not in tables:
                     continue
@@ -202,9 +243,9 @@ def _migrate_columns(engine) -> None:
 # ---------------------------------------------------------------------------
 # Synchronous core (always called from a worker thread via the wrappers below)
 # ---------------------------------------------------------------------------
-def _get_user(telegram_id: str, username: str = "") -> Dict[str, Any]:
-    if not init_db():
-        with _lock:
+async def _get_user(telegram_id: str, username: str = "") -> Dict[str, Any]:
+    if not await init_db():
+        async with _lock:
             rec = _memory["users"].setdefault(
                 str(telegram_id),
                 {
@@ -226,34 +267,36 @@ def _get_user(telegram_id: str, username: str = "") -> Dict[str, Any]:
             rec["last_seen"] = _utcnow().isoformat()
             return dict(rec)
 
-    with _lock:
-        session = _SessionFactory()
-        try:
-            row = session.query(User).filter(User.telegram_id == str(telegram_id)).one_or_none()
-            if row is None:
-                row = User(telegram_id=str(telegram_id), username=username or "",
-                           tier=TIER_FREE, api_key="", created_at=_utcnow(), last_seen=_utcnow())
-                session.add(row)
-            else:
-                row.last_seen = _utcnow()
-                if username:
-                    row.username = username
-            session.commit()
-            return {
-                "telegram_id": row.telegram_id,
-                "username": row.username or "",
-                "tier": row.tier or TIER_FREE,
-                "has_api_key": bool(row.api_key),
-                "voice_on": bool(row.voice_on),
-                "voice_lang": row.voice_lang or "en-US",
-                "voice_gender": row.voice_gender or "female",
-                "voice_name": row.voice_name or "",
-                "translate_lang": row.translate_lang or "",
-                "created_at": row.created_at.isoformat() if row.created_at else None,
-                "last_seen": row.last_seen.isoformat() if row.last_seen else None,
-            }
-        finally:
-            session.close()
+    # Use the database
+    session = _AsyncSessionFactory()
+    try:
+        # Check if user exists
+        result = await session.execute(select(User).where(User.telegram_id == str(telegram_id)))
+        row = result.scalar_one_or_none()
+        if row is None:
+            row = User(telegram_id=str(telegram_id), username=username or "",
+                       tier=TIER_FREE, api_key="", created_at=_utcnow(), last_seen=_utcnow())
+            session.add(row)
+        else:
+            row.last_seen = _utcnow()
+            if username:
+                row.username = username
+        await session.commit()
+        return {
+            "telegram_id": row.telegram_id,
+            "username": row.username or "",
+            "tier": row.tier or TIER_FREE,
+            "has_api_key": bool(row.api_key),
+            "voice_on": bool(row.voice_on),
+            "voice_lang": row.voice_lang or "en-US",
+            "voice_gender": row.voice_gender or "female",
+            "voice_name": row.voice_name or "",
+            "translate_lang": row.translate_lang or "",
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "last_seen": row.last_seen.isoformat() if row.last_seen else None,
+        }
+    finally:
+        await session.close()
 
 
 # Preference columns that users may set. Whitelisted so no caller can use this
@@ -262,10 +305,10 @@ _PREF_COLUMNS = ("voice_on", "voice_lang", "voice_gender", "voice_name",
                  "translate_lang")
 
 
-def _set_prefs(telegram_id: str, prefs: Dict[str, Any]) -> bool:
+async def _set_prefs(telegram_id: str, prefs: Dict[str, Any]) -> bool:
     """Update voice/translation preferences. Unknown keys are ignored."""
-    if not init_db():
-        with _lock:
+    if not await init_db():
+        async with _lock:
             rec = _memory["users"].setdefault(
                 str(telegram_id),
                 {"telegram_id": str(telegram_id), "username": "",
@@ -281,201 +324,231 @@ def _set_prefs(telegram_id: str, prefs: Dict[str, Any]) -> bool:
     clean = {k: v for k, v in prefs.items() if k in _PREF_COLUMNS}
     if not clean:
         return False
-    with _lock:
-        session = _SessionFactory()
-        try:
-            row = session.query(User).filter(
-                User.telegram_id == str(telegram_id)).one_or_none()
-            if row is None:
-                row = User(telegram_id=str(telegram_id), username="",
-                           tier=TIER_FREE, api_key="", created_at=_utcnow(),
-                           last_seen=_utcnow())
-                session.add(row)
-            for key, value in clean.items():
-                setattr(row, key, value)
-            session.commit()
-            return True
-        except Exception:
-            logger.warning("preference write failed for %s", telegram_id,
-                           exc_info=True)
-            return False
-        finally:
-            session.close()
+    session = _AsyncSessionFactory()
+    try:
+        result = await session.execute(select(User).where(User.telegram_id == str(telegram_id)))
+        row = result.scalar_one_or_none()
+        if row is None:
+            row = User(telegram_id=str(telegram_id), username="",
+                       tier=TIER_FREE, api_key="", created_at=_utcnow(),
+                       last_seen=_utcnow())
+            session.add(row)
+        for key, value in clean.items():
+            setattr(row, key, value)
+        await session.commit()
+        return True
+    except Exception:
+        logger.warning("preference write failed for %s", telegram_id,
+                       exc_info=True)
+        return False
+    finally:
+        await session.close()
 
 
-def _get_prefs(telegram_id: str) -> Dict[str, Any]:
+async def _get_prefs(telegram_id: str) -> Dict[str, Any]:
     """Preferences only, without touching tier or the username."""
-    user = _get_user(telegram_id)
+    user = await _get_user(telegram_id)
     return {k: user.get(k) for k in _PREF_COLUMNS}
 
 
-def _set_tier(telegram_id: str, tier: str, plan: Optional[str] = None,
+async def _set_tier(telegram_id: str, tier: str, plan: Optional[str] = None,
               provider: str = "manual", reference: str = "") -> bool:
     tier = (tier or TIER_FREE).lower()
     if tier not in VALID_TIERS:
         logger.warning("Refusing unknown tier %r", tier)
         return False
-    _get_user(telegram_id)  # ensure the user row exists
-    if not init_db():
-        with _lock:
+    await _get_user(telegram_id)  # ensure the user row exists
+    if not await init_db():
+        async with _lock:
             _memory["users"][str(telegram_id)]["tier"] = tier
         return True
-    with _lock:
-        session = _SessionFactory()
-        try:
-            row = session.query(User).filter(User.telegram_id == str(telegram_id)).one()
-            row.tier = tier
-            session.add(
-                Subscription(
-                    telegram_id=str(telegram_id),
-                    plan=plan or tier,
-                    provider=provider,
-                    reference=reference,
-                    created_at=_utcnow(),
-                    expires_at=None,
-                )
+    session = _AsyncSessionFactory()
+    try:
+        result = await session.execute(select(User).where(User.telegram_id == str(telegram_id)))
+        row = result.scalar_one()
+        row.tier = tier
+        session.add(
+            Subscription(
+                telegram_id=str(telegram_id),
+                plan=plan or tier,
+                provider=provider,
+                reference=reference,
+                created_at=_utcnow(),
+                expires_at=None,
+                tier=tier,  # Set the tier on the subscription
             )
-            session.commit()
-            return True
-        finally:
-            session.close()
+        )
+        await session.commit()
+        return True
+    except Exception:
+        logger.warning("failed to set tier for %s", telegram_id, exc_info=True)
+        return False
+    finally:
+        await session.close()
 
 
-def _bump(telegram_id: str, field: str, day: Optional[str] = None) -> int:
+async def _bump(telegram_id: str, field: str, day: Optional[str] = None) -> int:
     """Increment one daily counter and return its new value."""
     day = day or today_str()
-    if field not in ("daily_scans", "daily_ai_calls", "daily_media"):
+    # Map the field name to the column name in DailyUsage
+    field_map = {
+        "daily_scans": "daily_scans",
+        "daily_ai_calls": "daily_ai_calls",
+        "daily_media": "daily_media",
+        "daily_api_calls": "daily_ai_calls",  # map to the existing column
+    }
+    if field not in field_map:
         raise ValueError(f"unknown counter {field!r}")
-    if not init_db():
-        with _lock:
+    column_name = field_map[field]
+    if not await init_db():
+        async with _lock:
             bucket = _memory["daily"].setdefault(f"{telegram_id}|{day}",
                                                  {"daily_scans": 0, "daily_ai_calls": 0, "daily_media": 0})
-            bucket[field] += 1
-            return bucket[field]
-    with _lock:
-        session = _SessionFactory()
-        try:
-            row = (
-                session.query(DailyUsage)
-                .filter(DailyUsage.telegram_id == str(telegram_id), DailyUsage.day == day)
-                .one_or_none()
-            )
-            if row is None:
-                row = DailyUsage(telegram_id=str(telegram_id), day=day, daily_scans=0,
-                                 daily_ai_calls=0, daily_media=0)
-                session.add(row)
-            setattr(row, field, (getattr(row, field) or 0) + 1)
-            session.commit()
-            return getattr(row, field)
-        finally:
-            session.close()
+            bucket[column_name] += 1
+            return bucket[column_name]
+    session = _AsyncSessionFactory()
+    try:
+        result = await session.execute(
+            select(DailyUsage)
+            .where(DailyUsage.telegram_id == str(telegram_id), DailyUsage.day == day)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            row = DailyUsage(telegram_id=str(telegram_id), day=day, daily_scans=0,
+                             daily_ai_calls=0, daily_media=0)
+            session.add(row)
+        # Increment the column
+        current_value = getattr(row, column_name)
+        setattr(row, column_name, (current_value or 0) + 1)
+        await session.commit()
+        return getattr(row, column_name)
+    finally:
+        await session.close()
 
 
-def _usage_for(telegram_id: str, day: Optional[str] = None) -> Dict[str, int]:
+async def _usage_for(telegram_id: str, day: Optional[str] = None) -> Dict[str, int]:
     day = day or today_str()
-    if not init_db():
-        with _lock:
+    if not await init_db():
+        async with _lock:
             b = _memory["daily"].get(f"{telegram_id}|{day}",
                                      {"daily_scans": 0, "daily_ai_calls": 0, "daily_media": 0})
-            return dict(b)
-    with _lock:
-        session = _SessionFactory()
-        try:
-            row = (
-                session.query(DailyUsage)
-                .filter(DailyUsage.telegram_id == str(telegram_id), DailyUsage.day == day)
-                .one_or_none()
-            )
-            if row is None:
-                return {"daily_scans": 0, "daily_ai_calls": 0, "daily_media": 0}
-            return {"daily_scans": row.daily_scans or 0,
-                    "daily_ai_calls": row.daily_ai_calls or 0,
-                    "daily_media": row.daily_media or 0}
-        finally:
-            session.close()
+            # Return daily_api_calls instead of daily_ai_calls for consistency
+            return {"daily_scans": b["daily_scans"],
+                    "daily_api_calls": b["daily_ai_calls"],
+                    "daily_media": b["daily_media"]}
+    session = _AsyncSessionFactory()
+    try:
+        result = await session.execute(
+            select(DailyUsage)
+            .where(DailyUsage.telegram_id == str(telegram_id), DailyUsage.day == day)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return {"daily_scans": 0, "daily_api_calls": 0, "daily_media": 0}
+        return {"daily_scans": row.daily_scans or 0,
+                "daily_api_calls": row.daily_ai_calls or 0,
+                "daily_media": row.daily_media or 0}
+    finally:
+        await session.close()
 
 
-def _stats() -> Dict[str, Any]:
-    """Platform-wide counters for the admin dashboard."""
-    if not init_db():
-        with _lock:
+async def _stats() -> Dict[str, Any]:
+    """Platform-wide counters for the admin dashboard.
+
+    Performance optimized to avoid loading entire user list when not necessary.
+    """
+    if not await init_db():
+        async with _lock:
             users = list(_memory["users"].values())
             counts: Dict[str, int] = {}
             for u in users:
                 counts[u.get("tier", TIER_FREE)] = counts.get(u.get("tier", TIER_FREE), 0) + 1
             return {"total_users": len(users), "by_tier": counts, "storage": "memory"}
-    with _lock:
-        session = _SessionFactory()
-        try:
-            rows = session.query(User).all()
-            counts: Dict[str, int] = {}
-            for r in rows:
-                t = r.tier or TIER_FREE
-                counts[t] = counts.get(t, 0) + 1
-            subs = session.query(Subscription).all()
-            return {
-                "total_users": len(rows),
-                "by_tier": counts,
-                "subscriptions": len(subs),
-                "storage": DATABASE_URL.split("://")[0] if DATABASE_URL else "sqlite",
-            }
-        finally:
-            session.close()
+    session = _AsyncSessionFactory()
+    try:
+        # Performance optimization: Use count() instead of loading all records
+        from sqlalchemy import func
+        user_count_result = await session.execute(select(func.count(User.id)))
+        total_users = user_count_result.scalar()
+
+        # Get tier distribution efficiently
+        tier_count_result = await session.execute(
+            select(User.tier, func.count(User.id))
+            .group_by(User.tier)
+        )
+        counts: Dict[str, int] = {}
+        for tier, count in tier_count_result.all():
+            t = tier or TIER_FREE
+            counts[t] = count
+
+        # Get subscription count
+        sub_count_result = await session.execute(select(func.count(Subscription.id)))
+        total_subs = sub_count_result.scalar()
+
+        return {
+            "total_users": total_users,
+            "by_tier": counts,
+            "subscriptions": total_subs,
+            "storage": DATABASE_URL.split("://")[0] if DATABASE_URL else "sqlite",
+        }
+    finally:
+        await session.close()
 
 
-def _history(telegram_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+async def _history(telegram_id: str, limit: int = 5) -> List[Dict[str, Any]]:
     """Recent subscription/plan events for one user."""
-    if not init_db():
+    if not await init_db():
         return []
-    with _lock:
-        session = _SessionFactory()
-        try:
-            rows = (
-                session.query(Subscription)
-                .filter(Subscription.telegram_id == str(telegram_id))
-                .order_by(Subscription.id.desc())
-                .limit(limit)
-                .all()
-            )
-            return [{"plan": r.plan, "provider": r.provider, "reference": r.reference,
-                     "created_at": r.created_at.isoformat() if r.created_at else None}
-                    for r in rows]
-        finally:
-            session.close()
+    session = _AsyncSessionFactory()
+    try:
+        result = await session.execute(
+            select(Subscription)
+            .where(Subscription.telegram_id == str(telegram_id))
+            .order_by(Subscription.id.desc())
+            .limit(limit)
+        )
+        rows = result.scalars().all()
+        return [{"plan": r.plan, "provider": r.provider, "reference": r.reference,
+                 "created_at": r.created_at.isoformat() if r.created_at else None}
+                for r in rows]
+    finally:
+        await session.close()
 
 
-def _plan_counts(limit: int = 1000) -> Dict[str, int]:
+async def _plan_counts(limit: int = 1000) -> Dict[str, int]:
     """How many times each plan has been purchased. Powers the admin dashboard.
 
     A plan tally, not a revenue figure: there is no price table in this
     repository, so any currency amount would be invented.
     """
-    if not init_db():
-        with _lock:
+    if not await init_db():
+        async with _lock:
             return {}
-    with _lock:
-        session = _SessionFactory()
-        try:
-            rows = (
-                session.query(Subscription.plan)
-                .order_by(Subscription.id.desc())
-                .limit(limit)
-                .all()
-            )
-            counts: Dict[str, int] = {}
-            for (plan,) in rows:
-                key = plan or "unknown"
-                counts[key] = counts.get(key, 0) + 1
-            return counts
-        finally:
-            session.close()
+    session = _AsyncSessionFactory()
+    try:
+        # Performance optimization: Only fetch what we need and use efficient aggregation
+        from sqlalchemy import func
+        result = await session.execute(
+            select(Subscription.plan, func.count(Subscription.id))
+            .group_by(Subscription.plan)
+            .order_by(func.count(Subscription.id).desc())
+            .limit(limit)
+        )
+        rows = result.all()
+        counts: Dict[str, int] = {}
+        for plan, count in rows:
+            key = plan or "unknown"
+            counts[key] = count
+        return counts
+    finally:
+        await session.close()
 
 
 # ---------------------------------------------------------------------------
 # Async wrappers - use these from Telegram handlers
 # ---------------------------------------------------------------------------
 async def aget_user(telegram_id: str, username: str = "") -> Dict[str, Any]:
-    return await asyncio.to_thread(_get_user, str(telegram_id), username)
+    return await _get_user(telegram_id, username)
 
 
 async def aget_tier(telegram_id: str) -> str:
@@ -485,47 +558,51 @@ async def aget_tier(telegram_id: str) -> str:
 
 async def aset_tier(telegram_id: str, tier: str, plan: Optional[str] = None,
                     provider: str = "manual", reference: str = "") -> bool:
-    return await asyncio.to_thread(_set_tier, str(telegram_id), tier, plan, provider, reference)
+    return await _set_tier(telegram_id, tier, plan, provider, reference)
 
 
 async def abump(telegram_id: str, field: str) -> int:
-    return await asyncio.to_thread(_bump, str(telegram_id), field)
+    return await _bump(telegram_id, field)
 
 
 async def ausage(telegram_id: str) -> Dict[str, int]:
-    return await asyncio.to_thread(_usage_for, str(telegram_id))
+    return await _usage_for(telegram_id)
 
 
 async def astats() -> Dict[str, Any]:
-    return await asyncio.to_thread(_stats)
+    return await _stats()
 
 
 async def ahistory(telegram_id: str, limit: int = 5) -> List[Dict[str, Any]]:
-    return await asyncio.to_thread(_history, str(telegram_id), limit)
+    return await _history(telegram_id, limit)
 
 
 async def aplan_counts(limit: int = 1000) -> Dict[str, int]:
-    return await asyncio.to_thread(_plan_counts, limit)
+    return await _plan_counts(limit)
 
 
 async def aset_prefs(telegram_id: str, **prefs: Any) -> bool:
     """Persist voice/translation preferences off the event loop."""
-    return await asyncio.to_thread(_set_prefs, str(telegram_id), prefs)
+    return await _set_prefs(telegram_id, prefs)
 
 
 async def aget_prefs(telegram_id: str) -> Dict[str, Any]:
-    return await asyncio.to_thread(_get_prefs, str(telegram_id))
+    return await _get_prefs(telegram_id)
 
 
 if __name__ == "__main__":  # pragma: no cover - manual smoke check
     import json
+    import asyncio
 
-    print("SQLAlchemy available:", _HAVE_SQLALCHEMY)
-    print("init_db:", init_db())
-    print("user:", json.dumps(_get_user("123", "tester"), indent=2))
-    print("scan count:", _bump("123", "daily_scans"))
-    print("usage:", _usage_for("123"))
-    print("tier set:", _set_tier("123", TIER_PRO, plan="pro_monthly", provider="dodo"))
-    print("tier now:", _get_user("123")["tier"])
-    print("stats:", _stats())
-    print("history:", _history("123"))
+    async def main():
+        print("SQLAlchemy available:", _HAVE_SQLALCHEMY)
+        print("init_db:", await init_db())
+        print("user:", json.dumps(await _get_user("123", "tester"), indent=2))
+        print("scan count:", await _bump("123", "daily_scans"))
+        print("usage:", await _usage_for("123"))
+        print("tier set:", await _set_tier("123", TIER_PRO, plan="pro_monthly", provider="dodo"))
+        print("tier now:", (await _get_user("123"))["tier"])
+        print("stats:", await _stats())
+        print("history:", await _history("123"))
+
+    asyncio.run(main())
