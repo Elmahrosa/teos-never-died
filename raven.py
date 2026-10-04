@@ -1,4 +1,10 @@
-import os, subprocess, sys, argparse, datetime, json, time, shutil
+import os
+import subprocess
+import sys
+import argparse
+import datetime
+import json
+import time
 
 try:
     import ollama
@@ -18,8 +24,14 @@ RETRY_DELAY = 2
 # it warm across a normal session. Set RAVEN_KEEP_ALIVE="" to restore the
 # Ollama default, or e.g. "10m" to trade RAM for a shorter residency window.
 KEEP_ALIVE = os.getenv("RAVEN_KEEP_ALIVE", "30m").strip()
-
 _KA_OPTS = {"keep_alive": KEEP_ALIVE} if KEEP_ALIVE else {}
+
+# The canonical prompt, imported rather than redefined here. This module used to
+# carry its own copy that dropped the mandated 4-phase output format, so the CLI
+# and the Telegram bot answered the same question in different shapes. Both read
+# this one definition now. See NOTOUCH.md section 4 before editing it: the format
+# is contractual, and the text lives in multi_provider_ai.py.
+from multi_provider_ai import RAVEN_SYSTEM_PROMPT
 
 
 def ensure_session_dir():
@@ -44,11 +56,9 @@ def auto_save(messages, model, interval=0):
         return  # Disabled
         
     ensure_session_dir()
-    # Only save if we have enough new messages since last save
     path = session_path("_autosave")
     save_interval = interval
     
-    # Check if we should save based on message count
     try:
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
@@ -56,22 +66,25 @@ def auto_save(messages, model, interval=0):
                 last_saved_count = data.get("_save_count", 0)
         else:
             last_saved_count = 0
-    except:
+    except Exception:
         last_saved_count = 0
         
     if len(messages) - last_saved_count >= save_interval:
-        data = {"model": model, "ts": now_str(), "messages": messages, "_save_count": len(messages)}
+        data = {
+            "model": model, 
+            "ts": now_str(), 
+            "messages": messages, 
+            "_save_count": len(messages)
+        }
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, separators=(',', ':'))  # More compact JSON
-        # Uncomment next line for debugging: print(f"[*] Auto-saved session ({len(messages)} messages)")
+            json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
 
 
 def add_knowledge(title, content, category="general"):
     """Add a knowledge item to the knowledge base"""
     ensure_knowledge_dir()
-    # Create a safe filename from the title
     safe_title = "".join(c for c in title if c.isalnum() or c in (" ", "-", "_")).rstrip()
-    safe_title = safe_title.replace(" ", "_")[:50]  # Limit length
+    safe_title = safe_title.replace(" ", "_")[:50]
     if not safe_title:
         safe_title = f"knowledge_{int(time.time())}"
     
@@ -110,18 +123,15 @@ def search_knowledge(query, category=None):
             with open(path, "r", encoding="utf-8") as f:
                 item = json.load(f)
                 
-            # Check category filter
             if category and item.get("category", "general") != category:
                 continue
                 
-            # Check if query matches title or content
             if (query_lower in item.get("title", "").lower() or 
                 query_lower in item.get("content", "").lower()):
                 results.append(item)
-        except:
-            continue  # Skip corrupted files
+        except Exception:
+            continue
     
-    # Sort by timestamp newest first
     results.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
     return results
 
@@ -142,7 +152,7 @@ def list_knowledge_categories():
             with open(path, "r", encoding="utf-8") as f:
                 item = json.load(f)
             categories.add(item.get("category", "general"))
-        except:
+        except Exception:
             continue
     
     return sorted(list(categories))
@@ -167,7 +177,7 @@ def get_knowledge_stats():
                 item = json.load(f)
             count += 1
             categories.add(item.get("category", "general"))
-        except:
+        except Exception:
             continue
     
     return {
@@ -198,14 +208,7 @@ def now_str():
 
 
 def get_reply(model, messages, stream=False):
-    """Send `messages` to the local Ollama model and return the reply text.
-
-    `stream` defaults to False so callers that only pass (model, messages)
-    work unchanged. The Telegram bot relies on this default.
-
-    Both paths pass keep_alive=KEEP_ALIVE so the model stays resident between
-    messages instead of being reloaded from disk every few minutes.
-    """
+    """Send `messages` to the local Ollama model and return the reply text."""
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -245,19 +248,24 @@ def get_reply(model, messages, stream=False):
 
 def cmd_help(_messages, _model):
     for c, d in COMMANDS.items():
-        print(f"  {c:12s} {d}")
+        print(f"  {c:18s} {d[0]}")
 
 
 def cmd_clear(messages, _model):
+    # Keep system prompt if it exists
+    sys_prompt = next((m for m in messages if m["role"] == "system"), None)
     messages.clear()
+    if sys_prompt:
+        messages.append(sys_prompt)
     print("[*] History cleared.")
 
 
 def cmd_history(messages, _model):
-    if not messages:
+    if len(messages) <= 1: # Only system prompt or empty
         print("[*] No history.")
         return
     for m in messages:
+        if m["role"] == "system": continue
         role = "You" if m["role"] == "user" else "RAVEN"
         text = m["content"][:120] + ("..." if len(m["content"]) > 120 else "")
         print(f"  {role}: {text}")
@@ -282,6 +290,7 @@ def cmd_export(messages, model):
     with open(filename, "w", encoding="utf-8") as f:
         f.write(f"# RAVEN Session — {now_str()} | model: {model}\n\n")
         for m in messages:
+            if m["role"] == "system": continue
             role = "You" if m["role"] == "user" else "RAVEN"
             f.write(f"### {role}\n{m['content']}\n\n")
     print(f"[*] Exported to {filename}")
@@ -298,10 +307,12 @@ def cmd_save(messages, model):
 
 
 def cmd_tokens(messages, _model):
-    total = sum(len(m["content"].split()) for m in messages)
-    user_msgs = sum(1 for m in messages if m["role"] == "user")
-    asst_msgs = sum(1 for m in messages if m["role"] == "assistant")
-    print(f"  Messages: {len(messages)} ({user_msgs} user, {asst_msgs} assistant)")
+    # Exclude system prompt from token estimation
+    active_msgs = [m for m in messages if m["role"] != "system"]
+    total = sum(len(m["content"].split()) for m in active_msgs)
+    user_msgs = sum(1 for m in active_msgs if m["role"] == "user")
+    asst_msgs = sum(1 for m in active_msgs if m["role"] == "assistant")
+    print(f"  Messages: {len(active_msgs)} ({user_msgs} user, {asst_msgs} assistant)")
     print(f"  ~Words:   {total}")
     print(f"  ~Tokens:  ~{int(total * 1.3)} (estimated)")
 
@@ -312,7 +323,8 @@ def cmd_load(messages, model):
                 if f.endswith(".json") and f != "_autosave.json"]
     if not sessions:
         print("[*] No saved sessions found.")
-        return
+        return None
+        
     print("[*] Saved sessions:")
     for i, s in enumerate(sessions, 1):
         path = session_path(s)
@@ -326,10 +338,10 @@ def cmd_load(messages, model):
         choice = int(input("  Load session #: ").strip())
         if choice == 0 or choice > len(sessions):
             print("[*] Cancelled.")
-            return
+            return None
     except (ValueError, EOFError):
         print("[*] Cancelled.")
-        return
+        return None
 
     name = sessions[choice - 1]
     path = session_path(name)
@@ -345,7 +357,7 @@ def cmd_load(messages, model):
 def cmd_cleanup(messages, model):
     """Clean up old session files"""
     ensure_session_dir()
-    sessions = [f for f in os.listdir(SESSION_DIR)
+    sessions = [f[:-5] for f in os.listdir(SESSION_DIR)
                 if f.endswith(".json") and f != "_autosave.json"]
     if not sessions:
         print("[*] No session files to clean up.")
@@ -353,15 +365,15 @@ def cmd_cleanup(messages, model):
         
     print(f"[*] Found {len(sessions)} session files:")
     for i, s in enumerate(sessions, 1):
-        path = session_path(s[:-5])  # Remove .json
+        path = session_path(s)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             count = len(data.get("messages", []))
             ts = data.get("ts", "unknown")
-            print(f"  {i}. {s[:-5]}  ({count} messages, {ts})")
-        except:
-            print(f"  {i}. {s[:-5]}  (corrupted or unreadable)")
+            print(f"  {i}. {s}  ({count} messages, {ts})")
+        except Exception:
+            print(f"  {i}. {s}  (corrupted or unreadable)")
     
     try:
         choice = input("\n[*] Enter numbers to delete (e.g., 1,3,5) or 'all' or 'none': ").strip().lower()
@@ -371,7 +383,6 @@ def cmd_cleanup(messages, model):
         if choice == 'all':
             to_delete = sessions
         else:
-            # Parse comma-separated numbers
             indices = [int(x.strip())-1 for x in choice.split(',') if x.strip().isdigit()]
             to_delete = [sessions[i] for i in indices if 0 <= i < len(sessions)]
             
@@ -419,9 +430,6 @@ def cmd_knowledgebase(messages, model):
 
 def cmd_addknowledge(messages, model):
     """Add a knowledge item"""
-    # Extract the rest of the command after /addknowledge
-    # In a real implementation, we'd parse the user input, but for simplicity,
-    # we'll prompt for input
     print("[+] Adding new knowledge item")
     title = input("    Title: ").strip()
     if not title:
@@ -451,7 +459,7 @@ def cmd_searchknowledge(messages, model):
         print("[!] Query is required")
         return
         
-    category = input("[+] Category (optional, press any key to skip): ").strip()
+    category = input("[+] Category (optional, press Enter to skip): ").strip()
     if not category:
         category = None
     
@@ -480,8 +488,7 @@ def cmd_listcategories(messages, model):
         
     print("[*] Knowledge Base Categories:")
     for category in categories:
-        # Count items in each category
-        items = search_knowledge("", category)  # Empty query gets all in category
+        items = search_knowledge("", category)
         print(f"    {category}: {len(items)} item(s)")
 
 
@@ -501,36 +508,31 @@ def cmd_stats(messages, model):
 
 def cmd_learn(messages, model):
     """Extract insights from recent session and add to knowledge base"""
-    if len(messages) < 2:
+    # Filter out system prompt for analysis
+    active_msgs = [m for m in messages if m["role"] != "system"]
+    if len(active_msgs) < 2:
         print("[!] Not enough conversation to learn from")
         return
         
     print("[+] Learning from recent session...")
-    
-    # Simple heuristic: look for exchanges that contain useful patterns
-    # In a more sophisticated implementation, we might use NLP techniques
     insights = []
     
-    # Look for user requests that generated detailed responses
-    for i in range(0, len(messages)-1, 2):  # Process user-assistant pairs
-        if i+1 < len(messages):
-            user_msg = messages[i]
-            assistant_msg = messages[i+1]
+    for i in range(0, len(active_msgs)-1, 2):
+        if i+1 < len(active_msgs):
+            user_msg = active_msgs[i]
+            assistant_msg = active_msgs[i+1]
             
             if user_msg.get("role") == "user" and assistant_msg.get("role") == "assistant":
                 user_content = user_msg.get("content", "").lower()
                 assistant_content = assistant_msg.get("content", "")
                 
-                # Simple trigger words that might indicate valuable knowledge
                 trigger_words = ["technique", "method", "tool", "command", "script", 
                                "vulnerability", "exploit", "bypass", "payload"]
                 
                 if any(word in user_content for word in trigger_words) and len(assistant_content) > 50:
-                    # Extract a reasonable insight
                     insight_title = f"Insight from session: {user_msg['content'][:30]}..."
                     insight_content = f"User asked: {user_msg['content']}\n\nRAVEN responded:\n{assistant_content[:500]}{'...' if len(assistant_content) > 500 else ''}"
                     
-                    # Try to categorize based on content
                     category = "general"
                     if any(word in assistant_content.lower() for word in ["network", "port", "scan", "recon"]):
                         category = "reconnaissance"
@@ -574,28 +576,31 @@ def cmd_learn(messages, model):
 
 
 COMMANDS = {
-    "/help":    ("Show available commands",                 cmd_help),
-    "/clear":   ("Clear conversation history",               cmd_clear),
-    "/history": ("Show conversation history",                cmd_history),
-    "/model":   ("Show current model",                       cmd_model),
-    "/system":  ("Show active system prompt",                cmd_system),
-    "/export":  ("Export history to markdown file",          cmd_export),
-    "/tokens":  ("Show message count and estimated tokens",  cmd_tokens),
-    "/save":    ("Save session to .raven_sessions/",         cmd_save),
-    "/load":    ("List and load a saved session",            cmd_load),
-    "/cleanup": ("Clean up old session files",               cmd_cleanup),
-    "/perf":    ("Show performance tips",                    cmd_performance),
-    "/knowledgebase": ("Manage the knowledge base",          cmd_knowledgebase),
-    "/addknowledge":  ("Add knowledge item",                 cmd_addknowledge),
-    "/searchknowledge": ("Search knowledge base",            cmd_searchknowledge),
-    "/listcategories":  ("List knowledge categories",        cmd_listcategories),
-    "/stats":     ("Show knowledge base statistics",         cmd_stats),
-    "/learn":     ("Extract insights from session",          cmd_learn),
+    "/help":            ("Show available commands",                 cmd_help),
+    "/clear":           ("Clear conversation history",              cmd_clear),
+    "/history":         ("Show conversation history",               cmd_history),
+    "/model":           ("Show current model",                      cmd_model),
+    "/system":          ("Show active system prompt",               cmd_system),
+    "/export":          ("Export history to markdown file",         cmd_export),
+    "/tokens":          ("Show message count and estimated tokens", cmd_tokens),
+    "/save":            ("Save session to .raven_sessions/",        cmd_save),
+    "/load":            ("List and load a saved session",           cmd_load),
+    "/cleanup":         ("Clean up old session files",              cmd_cleanup),
+    "/perf":            ("Show performance tips",                   cmd_performance),
+    "/knowledgebase":   ("Manage the knowledge base",               cmd_knowledgebase),
+    "/addknowledge":    ("Add knowledge item",                      cmd_addknowledge),
+    "/searchknowledge": ("Search knowledge base",                   cmd_searchknowledge),
+    "/listcategories":  ("List knowledge categories",               cmd_listcategories),
+    "/stats":           ("Show knowledge base statistics",          cmd_stats),
+    "/learn":           ("Extract insights from session",           cmd_learn),
 }
 
 
 def handle_command(cmd, messages, model):
-    entry = COMMANDS.get(cmd)
+    # Handle commands that might have arguments (like /addknowledge Title | Content)
+    base_cmd = cmd.split()[0] if " " in cmd else cmd
+    entry = COMMANDS.get(base_cmd)
+    
     if entry:
         result = entry[1](messages, model)
         return result
@@ -618,7 +623,6 @@ def main():
     model = args.model
     messages = []
 
-    # Show startup banner unless quiet mode
     if not args.quiet_start:
         print("=" * 55)
         print(f"  RAVEN — Zero Limits  [model: {model}]")
@@ -634,6 +638,10 @@ def main():
         if not args.quiet_start:
             print(f"[*] Restored session ({len(messages)} messages, model: {model})")
 
+    # Ensure the system prompt is injected at the start of the conversation
+    if not messages or messages[0].get("role") != "system":
+        messages.insert(0, {"role": "system", "content": RAVEN_SYSTEM_PROMPT})
+
     while True:
         try:
             user_input = input("\n>> ").strip()
@@ -646,7 +654,7 @@ def main():
                 break
             if user_input.startswith("/"):
                 result = handle_command(user_input, messages, model)
-                if result and user_input == "/load":
+                if result and user_input.startswith("/load"):
                     model = result
                 continue
 
