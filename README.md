@@ -326,11 +326,17 @@ external service, so it is counted against the daily media quota.
 
 Users are split into three tiers, reset every UTC day:
 
-| Tier | Daily scans | Media | Image / document | Video |
-|------|-------------|-------|------------------|-------|
-| Free | 5 | none | no | no |
-| Pro | 50 | 50 | yes | no |
-| Enterprise | unlimited | unlimited | yes | yes |
+| Tier | Price | Daily scans | Media | Image / document | Video |
+|------|-------|-------------|-------|------------------|-------|
+| Free | $0 | 5 | none | no | no |
+| Pro | $19/mo or $182/yr | 50 | 50 | yes | no |
+| Enterprise | $79/mo or $758/yr | 1000 | 1000 | yes | yes |
+
+Enterprise is capped rather than unlimited on purpose: inference runs on the
+operator's CPU, where a 450-token prompt is measured at 234.5s. An uncapped tier
+attracts the heaviest users while the cost lands on the operator's hosting bill
+instead of on the customer's invoice. Raise the ceilings in `saas_manager.py`
+once real cost data justifies it.
 
 `/my_usage` shows the caller's tier, today's remaining quota and plan history.
 `/dashboard` adds tier counts and a plans-sold tally for the admin.
@@ -376,6 +382,33 @@ never downgrades a customer who already holds a higher tier.
 > No payment provider account is wired up in this repository. The parsing is
 > written against the common shape these vendors emit and still needs one live
 > delivery against real credentials before you can rely on it.
+
+### Creating the products, in the order that actually works
+
+The order matters, because each step depends on the previous one existing.
+
+1. Set `DODO_WEBHOOK_SECRET` to a random value, and enter the same value as the
+   webhook secret on the provider dashboard. `python -c "import secrets;
+   print(secrets.token_hex(32))"` generates one. Until both sides match, every
+   delivery is rejected.
+2. Create four products - `pro_monthly`, `pro_annual`, `enterprise_monthly`,
+   `enterprise_annual` - priced at $19, $182, $79 and $758. The price ID is what
+   `PLAN_MAP` in `webhook_server.py` matches on, so keep those four names
+   exactly, or extend the map to match what the dashboard issued.
+3. Point the provider's webhook at `POST /webhook/payment`. It must send the
+   signed raw body.
+4. Attach the buyer's Telegram id to the payment as metadata. Every notification
+   tells them `/start` displays it, because without that field the webhook
+   cannot know who to credit.
+5. Set `PAYMENT_CHECKOUT_URL`, then confirm `GET /health` reports
+   `signature_verification: true`.
+6. Send one low-value real payment end to end and confirm the tier lands with
+   `/my_usage`. Only this proves the integration; everything above is
+   configuration that can still be wrong in a way no test covers.
+
+Price IDs not listed in `PLAN_MAP` return 422 and credit nobody, which is the
+safe failure. A product created in the dashboard with an unexpected name will
+fail that way rather than granting the wrong tier.
 
 ---
 

@@ -2021,12 +2021,19 @@ async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             marks.append("\u2713" if cap in cfg["capabilities"] else "\u2717")
         lines.append(f"  {cfg['label']:<11} {cfg['blurb']}")
         lines.append(f"              {' '.join(marks)}  (chat/scan/img/doc/video)")
+        # Prices come from saas_manager's display strings, so the table the bot
+        # shows and the table in the README cannot drift apart.
+        price = cfg["price_monthly"]
+        if price != "$0":
+            price += f" monthly  or  {cfg['price_annual']}"
+        lines.append(f"              {price}")
 
     lines += ["", "  \u2713 = included"]
     if checkout:
         lines += ["", f"Checkout: {checkout}"]
-        lines += ["Your Telegram id must be attached to the payment so the",
-                  "webhook can credit your account (/start shows it)."]
+        lines += ["Pick your plan there. Your Telegram id must be attached to",
+                  "the payment so the webhook can credit your account",
+                  "(/start shows it)."]
     else:
         lines += ["", "Checkout is not configured on this deployment.",
                   "The operator must set PAYMENT_CHECKOUT_URL in .env."]

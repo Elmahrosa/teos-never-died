@@ -66,6 +66,16 @@ IDEMPOTENCY_WINDOW = int(os.getenv("PAYMENT_IDEMPOTENCY_WINDOW", "86400"))
 NOTIFY_TELEGRAM = os.getenv("PAYMENT_NOTIFY_TELEGRAM", "true").lower() in ("1", "true", "yes", "on")
 
 # Provider price IDs -> tier. The webhook grants only what is listed here.
+#
+# The KEYS below must match the price IDs created in the payment provider's
+# dashboard exactly. The amounts are configured there, not here, so this map
+# deliberately says nothing about price: it only decides which tier a given
+# product grants. When adding a product, add its price ID here first, then
+# create the product using that same ID. A payload naming a product missing
+# from this map gets a 422 and credits nobody, which is the safe direction.
+#
+# Bare "pro" and "enterprise" are accepted for providers that do not
+# distinguish billing periods.
 PLAN_MAP: Dict[str, str] = {
     "pro_monthly": database.TIER_PRO,
     "pro_annual": database.TIER_PRO,

@@ -46,6 +46,11 @@ TIERS: Dict[str, Dict[str, Any]] = {
         "daily_media": 0,
         "capabilities": {A_TEXT, A_TRANSLATE},
         "blurb": "5 scans/day - chat & translation",
+        # Display only. The amount actually charged lives in the payment
+        # provider's dashboard, not here, so these strings and the real prices
+        # can drift; they exist so /upgrade can show something concrete.
+        "price_monthly": "$0",
+        "price_annual": "free",
     },
     database.TIER_PRO: {
         "label": "Pro",
@@ -53,14 +58,24 @@ TIERS: Dict[str, Dict[str, Any]] = {
         "daily_media": 50,
         "capabilities": {A_TEXT, A_TRANSLATE, A_SCAN, A_IMAGE, A_DOCUMENT, A_VOICE},
         "blurb": "50 scans/day - adds image, document & voice replies",
+        "price_monthly": "$19",
+        "price_annual": "$182/yr (save 20%)",
     },
     database.TIER_ENTERPRISE: {
         "label": "Enterprise",
-        "daily_scans": UNLIMITED,
-        "daily_media": UNLIMITED,
+        # Not UNLIMITED, deliberately. Inference runs on this host's CPU, where a
+        # 450-token prompt is measured at 234.5s (see OLLAMA_TIMEOUT in
+        # multi_provider_ai.py). An uncapped tier attracts exactly the heavy
+        # users who make that expensive, and the cost shows up as a hosting bill
+        # rather than as usage the customer is billed for. These ceilings are
+        # roughly 20x Pro; raise them once real cost data justifies it.
+        "daily_scans": 1000,
+        "daily_media": 1000,
         "capabilities": {A_TEXT, A_TRANSLATE, A_SCAN, A_IMAGE, A_DOCUMENT,
                          A_VIDEO, A_VOICE},
-        "blurb": "Unlimited - adds video analysis & API access",
+        "blurb": "1000 scans/day - adds video analysis & API access",
+        "price_monthly": "$79",
+        "price_annual": "$758/yr (save 20%)",
     },
 }
 
