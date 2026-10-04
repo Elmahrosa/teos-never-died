@@ -40,6 +40,11 @@ import time
 from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
 
+from dotenv import load_dotenv
+
+# FIX 1: Load environment variables so WEBHOOK_SECRET and TELEGRAM_TOKEN are visible
+load_dotenv()
+
 import database
 
 logging.basicConfig(
@@ -193,7 +198,8 @@ def _is_paid(payload: Dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 async def notify_telegram(telegram_id: str, tier: str, plan: str) -> bool:
     """Best-effort upgrade notice. Failure never fails the webhook."""
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    # FIX 2: Reconcile token env var name to match .env and telegram_bot.py
+    token = os.getenv("TELEGRAM_TOKEN", "").strip()
     if not NOTIFY_TELEGRAM or not token:
         return False
     label = tier.capitalize()
