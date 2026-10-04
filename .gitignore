@@ -73,6 +73,12 @@ raven_test_*.db
 # finally block, but a crash mid-analysis can leave user uploads behind.
 raven_media_tmp/
 
+# Watchdog single-instance lock (raven_watchdog.ps1 holds it exclusively so two
+# supervisors cannot both restart the bot). Runtime state, never tracked.
+# The .log files it and Run_RAVEN_Persistent.bat write are already covered by
+# the *.log rule above.
+raven_watchdog.lock
+
 # Catch every .env variant (.env.txt, .env.local, .env.production) rather than
 # just .env. A copy of the real .env under a different suffix is the same secret
 # exposure, and the plain `.env` line above does not cover it. The negation

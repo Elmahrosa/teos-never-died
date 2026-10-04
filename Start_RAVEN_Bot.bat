@@ -62,5 +62,8 @@ if not "%EXITCODE%"=="0" (
     echo   [OK] RAVEN stopped cleanly.
 )
 echo.
-pause
+REM Only pause for a human who double-clicked this file. When RAVEN_HEADLESS is
+REM set (Run_RAVEN_Persistent.bat / Scheduled Task) there is no console to press
+REM a key in, and pausing there would hang the service forever.
+if not defined RAVEN_HEADLESS pause
 endlocal

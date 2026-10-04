@@ -1,52 +1,46 @@
 @echo off
 REM ============================================================
-REM  RAVEN Security Bot - Persistent Launcher
-REM  Restarts the bot after a crash, but a clean exit stops here.
+REM  RAVEN Security Bot - Headless Launcher
+REM
+REM  Runs the bot once and exits with the bot's own exit code.
+REM  This script deliberately does NOT contain a restart loop:
+REM  auto-restart and start-at-boot are provided by the
+REM  "RAVEN Bot" Scheduled Task. Two restart mechanisms would
+REM  fight each other and hide real crash reasons.
+REM
+REM  Safe to run with no console and no user interaction:
+REM  * RAVEN_HEADLESS suppresses Start_RAVEN_Bot.bat's "press any key"
+REM  * rAVEN_launcher.log is written here; bot.log belongs to
+REM    telegram_bot.py's own logging.FileHandler and is NOT
+REM    redirected into, because two writers on one file made the
+REM    Python handler fail with "Permission denied" at startup.
 REM ============================================================
 setlocal
 cd /d "%~dp0"
 
-set "LOG=%CD%\bot.log"
-set "MAX_RESTARTS=10"
+set "RAVEN_HEADLESS=1"
+set "LAUNCH_LOG=%CD%\raven_launcher.log"
 
-echo.
-echo   RAVEN Security Bot - Persistent Mode
-echo   ------------------------------------------
-echo   Log:  %LOG%
-echo   Press Ctrl+C to stop
-echo   ------------------------------------------
-echo.
+REM ---- Resolve an absolute python path -----------------------------
+set "PYTHON="
+if exist "%CD%\.venv\Scripts\python.exe" set "PYTHON=%CD%\.venv\Scripts\python.exe"
+if not defined PYTHON if exist "%CD%\venv\Scripts\python.exe" set "PYTHON=%CD%\venv\Scripts\python.exe"
+if not defined PYTHON (
+    for /f "delims=" %%i in ('where python 2^>nul') do (
+        if not defined PYTHON set "PYTHON=%%i"
+    )
+)
 
-set /a RESTARTS=0
+if not defined PYTHON (
+    echo [%date% %time%] FATAL: no python interpreter found >> "%LAUNCH_LOG%"
+    exit /b 1
+)
 
-:restart
-echo [%date% %time%] Starting RAVEN bot... >> "%LOG%"
-call "%~dp0Start_RAVEN_Bot.bat" >> "%LOG%" 2>&1
+echo [%date% %time%] starting RAVEN with %PYTHON% >> "%LAUNCH_LOG%"
+
+REM ---- Run the bot. Its own logging.FileHandler owns bot.log. -------
+"%PYTHON%" telegram_bot.py
 set "EXITCODE=%ERRORLEVEL%"
 
-REM Exit 0 means the bot shut down on purpose (Ctrl+C, token removed, clean
-REM /stop). Restarting there would fight the operator, so only restart on a
-REM crash.
-if "%EXITCODE%"=="0" goto :done
-
-set /a RESTARTS+=1
-if %RESTARTS% gtr %MAX_RESTARTS% goto :exhausted
-
-echo [%date% %time%] RAVEN exited with code %EXITCODE%. Restart %RESTARTS%/%MAX_RESTARTS% in 5s... >> "%LOG%"
-timeout /t 5 /nobreak >nul 2>&1
-goto :restart
-
-:exhausted
-echo.
-echo   RAVEN crashed %MAX_RESTARTS% times in a row. Not restarting again.
-echo   Last %MAX_RESTARTS% restarts are at the end of %LOG%
-echo.
-type "%LOG%" 2>nul | more +%RESTARTS%
-exit /b 1
-
-:done
-echo.
-echo   RAVEN stopped cleanly (exit 0). Not restarting.
-echo.
-endlocal
-exit /b 0
+echo [%date% %time%] RAVEN exited with code %EXITCODE% >> "%LAUNCH_LOG%"
+endlocal & exit /b %EXITCODE%
