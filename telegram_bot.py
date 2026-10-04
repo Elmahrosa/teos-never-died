@@ -12,8 +12,9 @@ import json
 import hashlib
 import time
 from contextlib import redirect_stdout
+import urllib.parse
 from urllib.parse import quote
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from raven import get_reply, now_str, auto_save, auto_load
 
@@ -2002,42 +2003,88 @@ async def my_usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /upgrade - explain the plans and how to buy.
+    """Handle /upgrade - show the plans and attach a real checkout button per plan.
 
-    The checkout link comes from PAYMENT_CHECKOUT_URL so the bot never invents
-    a URL. Without it the operator is told to configure one rather than being
-    sent to a 404.
+    One URL cannot serve four products: the buyer has to pick a plan, and the
+    webhook reads `price_id` back out of the payload to decide which tier to
+    grant. So each plan id gets its own button.
+
+    The buyer's Telegram id travels as `metadata[telegram_id]`, because the
+    webhook has no other way to know who to credit. It is urlencoded through
+    `urlencode` rather than concatenated, so a gateway that is strict about the
+    brackets in `metadata[telegram_id]` still receives a valid query string.
+
+    The links are an inline keyboard, not anchors in the body: legacy Telegram
+    Markdown has no link syntax, so `[text](url)` fails to parse and `send_long`
+    quietly downgrades to plain text, printing the raw markup at the user. An
+    inline button cannot degrade that way.
+
+    A plan with no URL configured still appears in the table, marked
+    unconfigured. Hiding it would make a partially configured deployment look
+    complete, and the operator would have no way to tell which one is missing.
     """
-    checkout = os.getenv("PAYMENT_CHECKOUT_URL", "").strip()
+    user_id = str(update.effective_user.id)
+
+    # Keyed on the database constants and on the literal plan ids, not derived
+    # by string surgery. `tier.replace("tier_", "")` yields the wrong key
+    # silently if a constant is ever renamed, which drops a paid plan's button
+    # with no error anywhere.
+    TIER_PLANS = {
+        database.TIER_PRO: (
+            ("pro_monthly", "Monthly",
+             os.getenv("PAYMENT_CHECKOUT_URL_PRO_MONTHLY", "").strip()),
+            ("pro_annual", "Annual",
+             os.getenv("PAYMENT_CHECKOUT_URL_PRO_ANNUAL", "").strip()),
+        ),
+        database.TIER_ENTERPRISE: (
+            ("enterprise_monthly", "Monthly",
+             os.getenv("PAYMENT_CHECKOUT_URL_ENT_MONTHLY", "").strip()),
+            ("enterprise_annual", "Annual",
+             os.getenv("PAYMENT_CHECKOUT_URL_ENT_ANNUAL", "").strip()),
+        ),
+    }
+
     lines = [
         "\U0001F6E8 RAVEN PLANS",
         "-" * 34,
     ]
+    buttons: list = []
+
     for tier in (database.TIER_FREE, database.TIER_PRO, database.TIER_ENTERPRISE):
         cfg = saas.tier_config(tier)
-        marks = []
-        for cap in (saas.A_TEXT, saas.A_SCAN, saas.A_IMAGE,
-                    saas.A_DOCUMENT, saas.A_VIDEO):
-            marks.append("\u2713" if cap in cfg["capabilities"] else "\u2717")
-        lines.append(f"  {cfg['label']:<11} {cfg['blurb']}")
-        lines.append(f"              {' '.join(marks)}  (chat/scan/img/doc/video)")
-        # Prices come from saas_manager's display strings, so the table the bot
-        # shows and the table in the README cannot drift apart.
         price = cfg["price_monthly"]
         if price != "$0":
-            price += f" monthly  or  {cfg['price_annual']}"
+            price += f"/mo or {cfg['price_annual']}"
+        lines.append(f"  {cfg['label']:<11} {cfg['blurb']}")
         lines.append(f"              {price}")
 
-    lines += ["", "  \u2713 = included"]
-    if checkout:
-        lines += ["", f"Checkout: {checkout}"]
-        lines += ["Pick your plan there. Your Telegram id must be attached to",
-                  "the payment so the webhook can credit your account",
-                  "(/start shows it)."]
+        plans = TIER_PLANS.get(tier, ())
+        for plan_id, period, url in plans:
+            # Whitespace-only counts as unset: a var left as spaces would
+            # otherwise render a button that resolves to a broken checkout.
+            if not url.strip():
+                lines.append(f"              {period:<7} \u26A0 not configured")
+                continue
+            params = urllib.parse.urlencode({"metadata[telegram_id]": user_id})
+            sep = "&" if "?" in url else "?"
+            buttons.append([InlineKeyboardButton(
+                f"\U0001F9FE {cfg['label']} {period}",
+                url=f"{url}{sep}{params}")])
+        # Only invite a tap when this tier actually produced a button, so a
+        # partly configured deployment does not promise a payment path that
+        # isn't there.
+        if any(u.strip() for _, _, u in plans):
+            lines.append(f"              \u2192 tap below to pay")
+
+    if buttons:
+        await send_long(update, "\n".join(lines))
+        await update.message.reply_text(
+            "\U0001F517 Checkout \u00B7 your Telegram id is attached automatically",
+            reply_markup=InlineKeyboardMarkup(buttons))
     else:
         lines += ["", "Checkout is not configured on this deployment.",
-                  "The operator must set PAYMENT_CHECKOUT_URL in .env."]
-    await send_long(update, "\n".join(lines))
+                  "The operator must set the PAYMENT_CHECKOUT_URL_* vars in .env."]
+        await send_long(update, "\n".join(lines))
 
 # MODULE C: AUTOMATED DAILY INTELLIGENCE BRIEFINGS
 async def send_daily_briefing(bot):

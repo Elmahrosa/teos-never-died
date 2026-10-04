@@ -52,3 +52,10 @@ raven_test_*.db
 # Media scratch space for photo/video/document analysis. Files are deleted in a
 # finally block, but a crash mid-analysis can leave user uploads behind.
 raven_media_tmp/
+
+# Catch every .env variant (.env.txt, .env.local, .env.production) rather than
+# just .env. A copy of the real .env under a different suffix is the same secret
+# exposure, and the plain `.env` line above does not cover it. The negation
+# re-admits the template, which is the only one of these meant to be tracked.
+.env*
+!.env.example
