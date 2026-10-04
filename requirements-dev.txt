@@ -1,0 +1,7 @@
+# Test-only dependencies. Kept out of requirements.txt because the bot and
+# webhook never import these at runtime.
+#
+# httpx is required by fastapi's TestClient for end-to-end HTTP tests of the
+# webhook; the parser suite does not use it.
+pytest>=8.0
+httpx>=0.27

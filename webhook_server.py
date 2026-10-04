@@ -26,6 +26,12 @@ Payment providers are not configured or exercised in this repository; the
 provider-specific parsing below is written against the common shape these
 vendors emit and needs one live delivery attempt against real credentials before
 it can be called verified.
+
+The payload parsers are covered by tests/test_webhook_parsers.py, which asserts
+on parsed output for realistic fixtures. Status-code-only tests missed the
+original defect here: the Telegram id was found under `data.metadata` while the
+plan beside it was not, so a settled payment parsed an id, failed to parse a
+plan, and returned 422 without crediting anyone.
 """
 
 from __future__ import annotations
@@ -38,7 +44,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -124,27 +130,64 @@ def verify_signature(body: bytes, header: str) -> Tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # Payload parsing
 # ---------------------------------------------------------------------------
-def _find_telegram_id(node: Any, depth: int = 0) -> Optional[str]:
-    """Locate the buyer's Telegram id in a provider payload.
+# Wrapper keys the tree-walker is allowed to descend through. Recursion is
+# restricted to this fixed allow-list rather than every key in the tree.
+# Crediting a tier is irreversible, so an unrelated 9-digit number buried
+# somewhere unexpected must not be mistaken for a Telegram id, and a plan name
+# must not be picked up from an unvetted corner of the tree. An unknown wrapper
+# shape therefore returns None and a 422 instead of guessing.
+ALLOWED_WRAPPERS = ("metadata", "data", "event", "payload", "client_ref",
+                    "custom_data")
 
-    Recursion is restricted to a fixed allow-list of wrapper keys (`metadata`,
-    `data`, `event`, ...) rather than every key in the tree. Crediting a tier is
-    irreversible, so an unrelated 9-digit number buried somewhere unexpected
-    must not be mistaken for a Telegram id. An unknown wrapper shape therefore
-    returns None and a 422 instead of guessing.
+# Depth cap for the shared walker. Deep enough for the nesting real providers
+# emit (Dodo nests metadata under data.metadata), shallow enough that a
+# pathologically nested payload cannot drive unbounded recursion.
+MAX_WALK_DEPTH = 6
+
+
+def _find_in_tree(node: Any, target_keys: tuple, validator: Callable[[Any], bool],
+                  depth: int = 0) -> Any:
+    """Search a provider payload for the first value `validator` accepts.
+
+    Checks `target_keys` at the current level, then descends through
+    ALLOWED_WRAPPERS. Returns the raw value, or None if nothing matches.
+
+    Both the Telegram id and the plan are located with this one walker so they
+    cannot drift apart again: they previously disagreed on how deeply to recurse,
+    which meant a plan nested under `data.metadata` was invisible while the id
+    beside it resolved fine. That combination accepted a settled payment and then
+    rejected the plan with a 422, crediting nobody.
     """
-    if depth > 6 or not isinstance(node, dict):
+    if depth > MAX_WALK_DEPTH or not isinstance(node, dict):
         return None
-    for key in ("telegram_id", "telegramId", "telegram_user_id", "chat_id"):
+    for key in target_keys:
         val = node.get(key)
-        if isinstance(val, (int, str)) and str(val).strip().lstrip("-").isdigit():
-            return str(val).strip()
-    for key in ("metadata", "data", "event", "payload", "client_ref", "custom_data"):
+        if validator(val):
+            return val
+    for key in ALLOWED_WRAPPERS:
         if key in node:
-            found = _find_telegram_id(node[key], depth + 1)
-            if found:
+            found = _find_in_tree(node[key], target_keys, validator, depth + 1)
+            if found is not None:
                 return found
     return None
+
+
+def _find_telegram_id(node: Any) -> Optional[str]:
+    """Locate the buyer's Telegram id in a provider payload.
+
+    Returns a string, or None when no allowed key holds something that looks
+    like a Telegram id. The caller turns None into a 422 rather than guessing.
+    """
+    def _is_valid_id(val: Any) -> bool:
+        return (isinstance(val, (int, str))
+                and str(val).strip().lstrip("-").isdigit())
+
+    result = _find_in_tree(
+        node,
+        ("telegram_id", "telegramId", "telegram_user_id", "chat_id"),
+        _is_valid_id,
+    )
+    return str(result).strip() if result is not None else None
 
 
 def _find_event_id(payload: Dict[str, Any]) -> str:
@@ -165,13 +208,21 @@ def _find_event_id(payload: Dict[str, Any]) -> str:
 
 
 def _find_plan(payload: Dict[str, Any]) -> str:
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    for source in (payload, data):
-        for key in ("price_id", "plan_id", "product_id", "plan", "tier"):
-            val = source.get(key)
-            if isinstance(val, str) and val.strip().lower() in PLAN_MAP:
-                return val.strip().lower()
-    return ""
+    """Locate the purchased plan name, or "" when it cannot be resolved.
+
+    Only names present in PLAN_MAP are accepted, so a caller can never talk the
+    webhook into granting a tier that is not for sale. An unresolved plan is a
+    422, never a silent free-tier or a guessed default.
+    """
+    def _is_valid_plan(val: Any) -> bool:
+        return isinstance(val, str) and val.strip().lower() in PLAN_MAP
+
+    result = _find_in_tree(
+        payload,
+        ("price_id", "plan_id", "product_id", "plan", "tier"),
+        _is_valid_plan,
+    )
+    return result.strip().lower() if result else ""
 
 
 def _is_paid(payload: Dict[str, Any]) -> bool:
@@ -179,17 +230,26 @@ def _is_paid(payload: Dict[str, Any]) -> bool:
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
 
     event = str(payload.get("type") or payload.get("event") or "").lower()
+    status = str(payload.get("status") or data.get("status") or "").lower()
+
+    # Failure wins over success, in either field, and must be checked FIRST.
+    # The success shortcut below returns early, so a payload carrying both
+    # signals (type "payment.succeeded" with status "refunded", which providers
+    # emit when a settled payment is later reversed) used to be credited. Only
+    # a genuine, unambiguous failure is treated as settled-and-kept.
+    if any(word in event for word in ("failed", "cancel", "refund", "expired",
+                                      "dispute", "chargeback")):
+        return False
+    if any(word in status for word in ("failed", "cancel", "refund", "expired",
+                                       "dispute", "chargeback", "reversed")):
+        return False
+
     if event and any(
         word in event
         for word in ("succeeded", "paid", "active", "complete", "settled")
     ):
         return True
-    # Explicit failure statuses win over the substring check above.
-    if any(word in event for word in ("failed", "cancel", "refund", "expired",
-                                      "dispute", "chargeback")):
-        return False
 
-    status = str(payload.get("status") or data.get("status") or "").lower()
     return status in ("succeeded", "paid", "active", "complete", "settled", "captured")
 
 

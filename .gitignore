@@ -37,6 +37,11 @@ blobs/
 manifests/
 metadata/
 
+# Test scratch. The suite points DATABASE_URL at a temp sqlite file, but a
+# stray run against the default path would create this in the repo root.
+tests/.pytest_cache/
+.pytest_cache/
+
 # SaaS data. Holds every customer record, so it must never enter git history.
 raven_saas.db
 raven_saas.db-journal
