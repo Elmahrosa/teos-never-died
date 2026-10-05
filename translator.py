@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
@@ -252,6 +253,10 @@ def detect_ex(text: str) -> Dict[str, Any]:
 # Model plumbing
 # ---------------------------------------------------------------------------
 _installed_cache: Optional[List[str]] = None
+# Monotonic timestamp of the last failed probe, and how long to wait before
+# trying again. A failure must NOT be cached as "no models" - see below.
+_last_probe_failed: float = 0.0
+_PROBE_RETRY_SEC: float = 5.0
 
 
 def _fetch_installed_models() -> List[str]:
@@ -261,18 +266,28 @@ def _fetch_installed_models() -> List[str]:
     synchronous: the bot runs it via asyncio.to_thread, so a blocking HTTP call
     there is already off the event loop.
     """
-    global _installed_cache
+    global _installed_cache, _last_probe_failed
     if _installed_cache is not None:
         return _installed_cache
+    # A failed probe must never be cached as "no models installed". Doing so
+    # poisons the cache for the whole process life: one transient timeout made
+    # /translate report "No translation model available" and refuse to fall back
+    # to the chat model, for every request until the bot restarted, even though
+    # Ollama was healthy. Retry instead, rate-limited so a permanently down
+    # Ollama costs one 10s timeout per _PROBE_RETRY_SEC rather than per call.
+    now = time.monotonic()
+    if _last_probe_failed and (now - _last_probe_failed) < _PROBE_RETRY_SEC:
+        return []
     try:
         req = urllib.request.Request(OLLAMA_HOST + "/api/tags", method="GET")
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
         _installed_cache = [m.get("name", "") for m in data.get("models", [])]
+        _last_probe_failed = 0.0
     except Exception:
         logger.debug("could not reach ollama for model list", exc_info=True)
-        _installed_cache = []
-    return _installed_cache
+        _last_probe_failed = now
+    return _installed_cache if _installed_cache is not None else []
 
 
 async def installed_models() -> List[str]:

@@ -1662,9 +1662,11 @@ async def _reply_to_text(update: Update, context) -> str:
 
 async def languages_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /languages - list every supported translation language."""
-    # translation_status() probes Ollama; run it off the loop so an unreachable
-    # Ollama cannot stall the bot for the length of the HTTP timeout.
-    status = await asyncio.to_thread(translator.translation_status)
+    # translation_status() is already async and does its own offloading
+    # (installed_models -> asyncio.to_thread), so awaiting it directly keeps
+    # the event loop free. Wrapping it in to_thread instead returned the
+    # un-awaited coroutine, and status["in_use"] raised TypeError.
+    status = await translator.translation_status()
     rows = translator.list_languages()
     lines = ["\U0001F310 TRANSLATION LANGUAGES (%d)" % len(rows), ""]
     for i in range(0, len(rows), 2):
