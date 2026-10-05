@@ -99,6 +99,71 @@ try {
             continue
         }
 
+        # ---- Ollama readiness gate -------------------------------------------
+        # Run_RAVEN_Persistent.bat runs telegram_bot.py and nothing else; it has
+        # always assumed Ollama is already listening. If it is not, the first AI
+        # call dies with WinError 10061 and the bot reports
+        # "AI unavailable: all AI providers failed".
+        #
+        # Logon order between this watchdog and Ollama's own Startup shortcut is
+        # not guaranteed, so waiting for the port beats assuming it. If the
+        # server is down we start it ourselves instead of giving up.
+        $ollamaExe = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'
+        $ollamaPortUp = $false
+        try {
+            $ollamaPortUp = @(Get-NetTCPConnection -LocalPort 11434 -State Listen `
+                -ErrorAction Stop).Count -gt 0
+        } catch {
+            # Older Windows without Get-NetTCPConnection: fall back to a probe.
+            try {
+                $null = Invoke-RestMethod 'http://127.0.0.1:11434/api/tags' -TimeoutSec 4
+                $ollamaPortUp = $true
+            } catch {
+                $ollamaPortUp = $false
+            }
+        }
+
+        if (-not $ollamaPortUp) {
+            Write-Log 'ollama is not listening on 11434; waiting up to 90s' 'WARN'
+            $deadline = (Get-Date).AddSeconds(90)
+            while ((Get-Date) -lt $deadline) {
+                Start-Sleep -Seconds 5
+                try {
+                    if (@(Get-NetTCPConnection -LocalPort 11434 -State Listen `
+                            -ErrorAction Stop).Count -gt 0) {
+                        $ollamaPortUp = $true
+                        break
+                    }
+                } catch { }
+            }
+
+            if (-not $ollamaPortUp -and (Test-Path $ollamaExe)) {
+                Write-Log "starting ollama serve ($ollamaExe)" 'WARN'
+                Start-Process -FilePath $ollamaExe -ArgumentList 'serve' `
+                    -WindowStyle Hidden -ErrorAction SilentlyContinue
+                $deadline = (Get-Date).AddSeconds(90)
+                while ((Get-Date) -lt $deadline) {
+                    Start-Sleep -Seconds 5
+                    try {
+                        if (@(Get-NetTCPConnection -LocalPort 11434 -State Listen `
+                                -ErrorAction Stop).Count -gt 0) {
+                            $ollamaPortUp = $true
+                            break
+                        }
+                    } catch { }
+                }
+            }
+        }
+
+        if ($ollamaPortUp) {
+            Write-Log 'ollama ready on 11434'
+        } else {
+            # Launch anyway: the bot degrades rather than dies, and a cloud
+            # provider may still be configured. Blocking here would mean RAVEN
+            # never starts just because a local model server is unavailable.
+            Write-Log 'ollama still unreachable; launching RAVEN anyway' 'WARN'
+        }
+
         Write-Log 'launching RAVEN'
         $proc = Start-Process -FilePath 'cmd.exe' `
             -ArgumentList '/c', "`"$launcher`"" `

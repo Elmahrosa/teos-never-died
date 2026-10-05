@@ -1,10 +1,16 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 title RAVEN - Unrestricted Agent
-cd /d "C:\Users\Elmahrosa-Teos\Desktop\teos-never-died"
+cd /d "%~dp0"
 
-set "PYEXE=C:\Users\Elmahrosa-Teos\AppData\Local\Programs\Python\Python312\python.exe"
-set "OLLAMA_EXE=C:\Users\Elmahrosa-Teos\AppData\Local\Programs\Ollama\ollama.exe"
+REM Resolve both tools from PATH. These used to be hardcoded to a different
+REM Windows account (C:\Users\Elmahrosa-Teos\...) and a Python version that
+REM is not installed here, so this launcher could never start on this machine.
+set "PYEXE="
+for /f "delims=" %%i in ('where python 2^>nul') do if not defined PYEXE set "PYEXE=%%i"
+
+set "OLLAMA_EXE="
+for /f "delims=" %%i in ('where ollama 2^>nul') do if not defined OLLAMA_EXE set "OLLAMA_EXE=%%i"
 
 echo =======================================
 echo     RAVEN - Unrestricted Agent

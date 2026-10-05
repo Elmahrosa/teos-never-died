@@ -135,7 +135,16 @@ Stay in character. You are RAVEN. Every response must reflect your role as a sen
 PARAMETER temperature 0.75  // Slightly lower for more focused, analytical reasoning
 PARAMETER top_p 0.90
 PARAMETER repeat_penalty 1.08
-PARAMETER num_ctx 32768  // Increased context window for deeper reasoning
+// WAS 32768. Two caveats:
+//   1. This Modelfile was never applied - `ollama create raven -f Modelfile`
+//      was never run, so no `raven` model exists and RAVEN calls
+//      dolphin-llama3:8b directly at Ollama's default context (~4096).
+//      Verified with `ollama show --parameters dolphin-llama3:8b`, which
+//      reports no num_ctx override.
+//   2. KV cache scales with context, so 32768 would cost several GB of RAM
+//      per loaded model on an 11GB host.
+// 8192 is the safe ceiling if you ever do run `ollama create raven -f Modelfile`.
+PARAMETER num_ctx 8192  // Safe for 11GB host; 32768 was far too large
 """
 
 PARAMETER stop ["\n\n\n"]  // Prevent excessive repetition

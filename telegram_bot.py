@@ -3047,7 +3047,10 @@ async def _log_startup_warnings():
 
     ka = os.getenv("RAVEN_KEEP_ALIVE", "30m").strip()
     if ka:
-        logger.info("Ollama keep-alive: %s (model stays resident between messages)", ka)
+        if ka in ("0", "0s", "0m"):
+            logger.info("Ollama keep-alive: %s (model unloads after every reply)", ka)
+        else:
+            logger.info("Ollama keep-alive: %s (model stays resident between messages)", ka)
 
 async def post_shutdown(application):
     """Stop the scheduler cleanly when the bot shuts down."""
