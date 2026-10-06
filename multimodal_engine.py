@@ -79,6 +79,16 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 VISION_MODEL = os.getenv("RAVEN_VISION_MODEL", "llava").strip()
 CLOUD_TIMEOUT = float(os.getenv("CLOUD_AI_TIMEOUT", "60"))
 
+# Local vision on this host is CPU-only: llava is a 7B-class vision model and
+# runs roughly an order of magnitude slower than the 3B chat model. Two knobs
+# keep an image analysis from running forever or dying mid-answer:
+#   RAVEN_VISION_MAX_TOKENS  - cap the generated description (default 200,
+#                              ~4-8 minutes of CPU generation).
+#   RAVEN_VISION_READ_TIMEOUT - how long to wait for the whole local request
+#                              including a cold model load (default 900s).
+VISION_MAX_TOKENS = int(os.getenv("RAVEN_VISION_MAX_TOKENS", "200"))
+LOCAL_READ_TIMEOUT = float(os.getenv("RAVEN_VISION_READ_TIMEOUT", "900"))
+
 # Cloud media analysis is opt-out. Vision is the expensive path, so media only
 # leaves the machine when the operator has explicitly allowed it.
 CLOUD_MEDIA = os.getenv("CLOUD_MEDIA_ANALYSIS", "true").lower() in ("1", "true", "yes", "on")
@@ -193,11 +203,15 @@ async def _vision_local(image_path: str, prompt: str) -> str:
         "model": VISION_MODEL,
         "messages": [{"role": "user", "content": prompt, "images": [await _b64(image_path)]}],
         "stream": False,
-        "options": {"temperature": 0.2, "num_predict": 700},
+        "options": {"temperature": 0.2, "num_predict": VISION_MAX_TOKENS},
     }
-    # Run the blocking HTTP request in a thread to avoid blocking the event loop
+    # Run the blocking HTTP request in a thread to avoid blocking the event loop.
+    # The read timeout covers a cold model load plus CPU generation (see the
+    # RAVEN_VISION_* config above); Ollama stops generating at num_predict, so
+    # the answer is short rather than endless.
     response = await asyncio.to_thread(
-        lambda: requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=(30, 600))
+        lambda: requests.post(f"{OLLAMA_HOST}/api/chat", json=payload,
+                              timeout=(30, LOCAL_READ_TIMEOUT))
     )
     response.raise_for_status()
     return response.json()["message"]["content"].strip()
@@ -261,14 +275,43 @@ _BACKENDS = (("local", _vision_local), ("openai", _vision_openai), ("groq", _vis
 
 
 async def _no_vision_message(errors: List[str]) -> str:
-    lines = ["\U0001F5A5 No vision backend is configured.", ""]
+    """Honest failure message.
+
+    The old wording ("No vision backend is configured") was printed for
+    *any* failing backend - including the real cause here, a CPU-only
+    llava that cold-loads for ~90s and then generates slowly. Distinguish
+    "nothing is installed" from "installed but this attempt failed".
+    """
     local_ready, _ = await _local_vision_ready()
-    if not local_ready:
-        lines.append(f"Local:  ollama pull {VISION_MODEL}   (~4.7GB download)")
-    if not CLOUD_MEDIA:
-        lines.append("Cloud:  disabled via CLOUD_MEDIA_ANALYSIS=false")
+    timed_out = any("ReadTimeout" in e or "ConnectTimeout" in e
+                    or "timed out" in e.lower() for e in errors)
+    if local_ready:
+        lines = [
+            "\U0001F5BC Local vision is installed but this analysis did not finish.",
+            "",
+            f"Model:   {VISION_MODEL} (CPU-only host)",
+        ]
+        if timed_out:
+            lines.append(
+                "Why:     the request passed the "
+                f"{int(LOCAL_READ_TIMEOUT)}s cap - a cold load plus slow "
+                f"generation. Next attempt may succeed (the model stays warm "
+                f"for ~10 min after loading)."
+            )
+        lines += [
+            "",
+            "Options:",
+            "  - Retry once - the model may already be loaded now.",
+            "  - Cloud: add OPENAI_API_KEY or GROQ_API_KEY to .env "
+            "(CLOUD_MEDIA_ANALYSIS is on) for fast GPU-backed analysis.",
+        ]
     else:
-        lines.append("Cloud:  add OPENAI_API_KEY or GROQ_API_KEY to .env")
+        lines = ["\U0001F5A5 No vision backend is usable.", ""]
+        lines.append(f"Local:  ollama pull {VISION_MODEL}   (~4.7GB download)")
+        if not CLOUD_MEDIA:
+            lines.append("Cloud:  disabled via CLOUD_MEDIA_ANALYSIS=false")
+        else:
+            lines.append("Cloud:  add OPENAI_API_KEY or GROQ_API_KEY to .env")
     if errors:
         lines += ["", "Attempts:", *[f"  - {e}" for e in errors[:4]]]
     return "\n".join(lines)

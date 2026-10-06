@@ -506,6 +506,7 @@ HELP_REFERENCE = """
 /market <keyword> - Crypto market sentiment analysis (e.g., /market Bitcoin)
 /leak <target> - Breach data check for email/domain (e.g., /leak user@example.com)
 /darkweb_intel <topic> - Dark web threat intelligence (e.g., /darkweb_intel ransomware)
+/verify_badge <url or UUID> - Verify a Credly badge against its public record (issuer, recipient, dates)
 
 **AI Assistance:**
 /generate <topic> - Generate security reports, writeups, or documentation
@@ -1555,6 +1556,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             size = os.path.getsize(path)
             focus = _caption_focus(update.message.caption)
             prompt = mm.VISION_PROMPT + focus
+            # CPU-only host: a cold llava load is ~90s and generation is slow.
+            # Say so before the wait starts, or a few minutes of silence reads
+            # as a hang. (The note is edited, so no extra message spam.)
+            try:
+                await note.edit_text(
+                    "\U0001F5BC Image downloaded. Analyzing with the local "
+                    "vision model (may take several minutes on this CPU)...",
+                    parse_mode=None)
+            except Exception:
+                pass
             try:
                 # analyze_image/analyze_video are coroutines: they already
                 # move their own blocking I/O (ffmpeg, HTTP, file reads) into
@@ -2422,6 +2433,7 @@ def setup_scheduler(application):
 # ══════════════════════════════════════════════════════════════════════
 
 import analytics as raven_analytics
+import badge_verify
 import content_creator
 import social_media_manager
 from energy_manager import get_store as get_energy_store
@@ -3249,6 +3261,32 @@ async def energy_clear_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if count is None:
         return
     await send_long(update, f"🗑 Erased {count} readings (tariff settings kept).")
+
+
+async def verify_badge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /verify_badge <credly url or uuid> - verify a badge factually.
+
+    Reads Credly's own public metadata (never the LLM, which once turned
+    'Claude Partner issued by Anthropic to Ayman Seif' into 'Issuer:
+    Twitter'). Quick REST call, so it runs inline; the reply is the
+    issuer's record verbatim.
+    """
+    if not context.args:
+        await send_long(
+            update,
+            "❌ Usage: /verify_badge <credly URL or UUID>\n"
+            "Example: /verify_badge https://www.credly.com/badges/<uuid>\n"
+            "Or paste a badge UUID on its own.",
+        )
+        return
+    try:
+        info = await asyncio.to_thread(
+            badge_verify.verify_badge, " ".join(context.args))
+    except Exception as exc:
+        logger.warning("badge verification failed: %s", exc)
+        await send_long(update, f"❌ {exc}")
+        return
+    await send_long(update, badge_verify.format_badge(info))
 
 
 async def post_init(application):
@@ -5415,6 +5453,9 @@ def main():
     application.add_handler(CommandHandler("energy_import", energy_import_command))
     application.add_handler(CommandHandler("energy_tariff", energy_tariff_command))
     application.add_handler(CommandHandler("energy_clear", energy_clear_command))
+
+    # Credential verification - factual, no LLM guessing.
+    application.add_handler(CommandHandler("verify_badge", verify_badge_command))
 
     # SaaS tiers, quota visibility and plan information
     if SAAS_AVAILABLE:

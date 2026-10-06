@@ -33,6 +33,7 @@ MODULES = [
     "social_media_manager",
     "trading_engine",
     "energy_manager",
+    "badge_verify",
     "dashboard",
     "telegram_bot",
     "webhook_server",
