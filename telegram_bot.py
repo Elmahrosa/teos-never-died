@@ -508,6 +508,11 @@ HELP_REFERENCE = """
 /darkweb_intel <topic> - Dark web threat intelligence (e.g., /darkweb_intel ransomware)
 /verify_badge <url or UUID> - Verify a Credly badge against its public record (issuer, recipient, dates)
 
+**Agent Mode (answer, think, search, non-stop):**
+/think <question> - Deep answer: plans searches, searches the web (DuckDuckGo, no key), composes a cited answer, refines up to 3 rounds
+/search <query> - Quick web search: top links + snippets
+RAVEN auto-switches to agent mode for questions that need current info ("what is the latest...", URLs, news, prices, years).
+
 **AI Assistance:**
 /generate <topic> - Generate security reports, writeups, or documentation
 /scrape <text> - Extract key information from security texts or logs
@@ -1388,8 +1393,89 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cleanup_temp_file(temp_ogg_path)
         cleanup_temp_file(temp_wav_path)
 
+async def _keep_typing_indicator(update: Update):
+    """Keep the Telegram typing bubble alive for long agent runs."""
+    while True:
+        await asyncio.sleep(4)
+        try:
+            await update.message.chat.send_action("typing")
+        except Exception:
+            return
+
+
+async def _agent_respond(update: Update, prompt: str):
+    """Run the think -> search -> answer loop and deliver a live-updated reply.
+
+    Used by /think and by the chat auto-trigger. The agent loop is blocking,
+    so it runs in a worker thread; progress messages are marshalled back to
+    the event loop and streamed into a single placeholder message, and the
+    final answer is guaranteed to be a real message (the loop never raises
+    for model/network failures).
+    """
+    placeholder = await update.message.reply_text(
+        "\U0001f9e0 RAVEN is searching the web\u2026")
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _produce():
+        def cb(msg):
+            loop.call_soon_threadsafe(queue.put_nowait, ("status", msg))
+        try:
+            result = agent_engine.run_agent(prompt, progress_cb=cb)
+            loop.call_soon_threadsafe(queue.put_nowait, ("done", result))
+        except Exception as exc:
+            logger.error("agent loop crashed: %s", exc)
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                ("error", f"\u274c Agent failed unexpectedly: {exc}"))
+
+    task = asyncio.create_task(asyncio.to_thread(_produce))
+    typing_task = asyncio.create_task(_keep_typing_indicator(update))
+    final = None
+    last_edit = 0.0
+    try:
+        while True:
+            kind, payload = await queue.get()
+            if kind == "status":
+                now = time.monotonic()
+                if now - last_edit >= 2.0:
+                    last_edit = now
+                    try:
+                        await placeholder.edit_text(str(payload)[:4000])
+                    except Exception:
+                        pass
+            elif kind == "done":
+                final = payload
+                break
+            else:
+                final = {"answer": payload, "sources": [],
+                         "warning": None}
+                break
+    finally:
+        typing_task.cancel()
+        await task
+
+    try:
+        await placeholder.delete()
+    except Exception:
+        pass
+    text = agent_engine._agent_reply_text(final)
+    await send_long(update, text)
+    if text:
+        conversation_history.append({"role": "user", "content": prompt})
+        conversation_history.append({"role": "assistant", "content": text})
+        del conversation_history[:-40]  # keep the saved session bounded
+        auto_save(conversation_history, current_model)
+    return text
+
+
 async def _chat_respond(update: Update, prompt: str):
     """Shared chat pipeline: stream the reply, then record it in history."""
+    # Questions that need fresh/current information skip the fast stream and
+    # go through the agent loop (think -> search -> answer). The heuristic is
+    # deliberately conservative so ordinary chat keeps the ~16s reply.
+    if agent_engine.needs_web_agent(prompt):
+        return await _agent_respond(update, prompt)
     response = await stream_ai_reply(update, prompt)
     if not response:
         return None
@@ -2440,6 +2526,10 @@ from energy_manager import get_store as get_energy_store
 from multi_provider_ai import ROUTER, RAVEN_SYSTEM_PROMPT, OLLAMA_TIMEOUT
 from trading_engine import TradingEngine
 
+# Agent mode: think -> search -> answer (web_search.py is DuckDuckGo, no key)
+import agent_engine
+import web_search
+
 # Shared engine instance (paper mode by default - see .env TRADING_MODE)
 TRADING = TradingEngine()
 
@@ -3287,6 +3377,59 @@ async def verify_badge_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await send_long(update, f"❌ {exc}")
         return
     await send_long(update, badge_verify.format_badge(info))
+
+
+# ── Agent mode: /think (deep, non-stop) and /search (quick) ──────────
+async def think_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/think <question> - plan, search the web, answer, refine.
+
+    Runs the agent loop: a fast local model plans 1-3 search queries,
+    RAVEN searches DuckDuckGo (no API key), composes a cited answer, and
+    refines up to RAVEN_AGENT_MAX_ROUNDS (default 3) times if a fact is
+    missing. Progress is streamed into a live message, so the user always
+    sees it working - never a frozen "analyzing..." bubble.
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "\U0001f9e0 Usage: /think <question>\n"
+            "Example: /think What is the latest Python release and its "
+            "new features?",
+        )
+        return
+    query = " ".join(context.args)[:800]
+    await _agent_respond(update, query)
+
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/search <query> - quick web search: top links + snippets, no LLM."""
+    if not context.args:
+        await update.message.reply_text(
+            "🔍 Usage: /search <query>\n"
+            "Example: /search python 3.13 release",
+        )
+        return
+    query = " ".join(context.args)[:500]
+    msg = await update.message.reply_text("🔍 Searching…")
+    try:
+        results = await asyncio.to_thread(web_search.search, query, 6)
+    except web_search.SearchError as exc:
+        logger.warning("search command failed: %s", exc)
+        await msg.edit_text(f"❌ Search failed: {exc}")
+        return
+    if not results:
+        await msg.edit_text("🔍 No results found for that query.")
+        return
+    lines = [f"🔍 **{query}**"]
+    for i, r in enumerate(results, 1):
+        snippet = (r.get("snippet") or "").strip()
+        if len(snippet) > 180:
+            snippet = snippet[:180] + "…"
+        lines.append(f"{i}. {r.get('title', '').strip()}\n"
+                     f"   {r.get('url', '').strip()}"
+                     + (f"\n   {snippet}" if snippet else ""))
+    lines.append("")
+    lines.append("Tip: /think <question> for a full analysed answer.")
+    await msg.edit_text("\n\n".join(lines)[:4000])
 
 
 async def post_init(application):
@@ -5456,6 +5599,10 @@ def main():
 
     # Credential verification - factual, no LLM guessing.
     application.add_handler(CommandHandler("verify_badge", verify_badge_command))
+
+    # Agent mode - think -> search -> answer (non-stop loop) + quick search.
+    application.add_handler(CommandHandler("think", think_command))
+    application.add_handler(CommandHandler("search", search_command))
 
     # SaaS tiers, quota visibility and plan information
     if SAAS_AVAILABLE:

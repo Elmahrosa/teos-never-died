@@ -34,6 +34,8 @@ MODULES = [
     "trading_engine",
     "energy_manager",
     "badge_verify",
+    "web_search",
+    "agent_engine",
     "dashboard",
     "telegram_bot",
     "webhook_server",
