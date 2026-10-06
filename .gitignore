@@ -69,6 +69,13 @@ raven_saas.db-wal
 raven_saas.db-shm
 raven_test_*.db
 
+# Energy meter database. Hourly consumption history is private local data;
+# energy.db (+ WAL/SHM sidecars, matching the SaaS pattern above).
+energy.db
+energy.db-journal
+energy.db-wal
+energy.db-shm
+
 # Media scratch space for photo/video/document analysis. Files are deleted in a
 # finally block, but a crash mid-analysis can leave user uploads behind.
 raven_media_tmp/

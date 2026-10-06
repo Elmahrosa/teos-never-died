@@ -4,6 +4,33 @@ from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
+
+# How long an AI command (/scan, /cve, /exploit, ...) may run before the user
+# sees "Request failed: timeout". The old hard-coded 60s was shorter than a
+# single reply from an 8B model on this CPU (measured 134s for 89 tokens), so
+# it tripped constantly. Commands run on COMMAND_MODEL (an 8B model at
+# ~1.2 tok/s here), so a full report can take several minutes: 600s ceiling.
+CMD_TIMEOUT = float(os.getenv("RAVEN_CMD_TIMEOUT", "600"))
+
+# Model for commands that need real security depth. llama3.2:3b (the fast
+# chat model) REFUSES /scan-style recon prompts even with an authorization
+# system prompt, while dolphin-llama3:8b answers them - so commands get their
+# own model. Chat keeps RAVEN_MODEL for speed (~16s vs ~134s per reply).
+COMMAND_MODEL = os.getenv("RAVEN_COMMAND_MODEL") or os.getenv("RAVEN_MODEL", "dolphin-llama3:8b")
+
+# Short identity/scope prompt for the command path. Commands passed only the
+# raw user prompt, so dolphin-llama3:8b self-identified as "I am Dolphin, a
+# helpful AI assistant..." instead of RAVEN. Deliberately ~50 tokens: the full
+# RAVEN_SYSTEM_PROMPT (~450) measured ~234s of prefill on this CPU. Blank
+# RAVEN_COMMAND_IDENTITY="" disables it.
+COMMAND_IDENTITY = os.getenv(
+    "RAVEN_COMMAND_IDENTITY",
+    "You are RAVEN, a security assistant operating under an authorized "
+    "penetration-testing engagement on targets the operator owns. Reply as "
+    "RAVEN (never as Dolphin or another assistant), answer directly. "
+    "Keep replies tight: bullets over prose, no preamble, normally under "
+    "~180 words; only go deeper when the operator asks (speed matters).",
+).strip()
 import logging
 import io
 import shutil
@@ -193,6 +220,10 @@ def _chunk_for_telegram(text):
 
 async def aget_reply(model, messages, stream=False):
     """`raven.get_reply` executed off the event loop."""
+    # Prepend the RAVEN identity prompt unless the caller already set one
+    # (fresh list, caller's messages are not mutated).
+    if COMMAND_IDENTITY and (not messages or messages[0].get("role") != "system"):
+        messages = [{"role": "system", "content": COMMAND_IDENTITY}] + list(messages)
     return await asyncio.to_thread(get_reply, model, messages, stream)
 
 
@@ -529,6 +560,17 @@ Amounts are notional. Buy/sell/mode/stop/resume are admin-only.
 Only Twitter/X posts directly; other platforms need your own approved developer
 apps, so those commands build the content and print the setup steps.
 
+**Predictive Energy Management:**
+/energy_demo [days] - Seed a synthetic month of hourly meter data
+/energy_log <kWh> [date time] - Log a reading (current hour if no time given)
+/energy_import <file.csv> - Import timestamp,kwh rows (header optional)
+/energy_status - Totals, peak hour, week-over-week change, anomaly flags
+/energy_forecast [hours] - Hourly forecast with peak/valley windows (default 24)
+/energy_report - Trend, load-shift advice and cost projection
+/energy_tariff [peak offpeak HH-HH] - Set or show your cost rates per kWh
+/energy_clear - Erase all readings (admin)
+Forecasting is pure local code - these reply instantly, no model load.
+
 **Usage Notes:**
 - Security commands trigger RAVEN's 4-phase assessment format
 - Natural conversation works too - just send a message
@@ -612,6 +654,7 @@ async def system_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 - Image / Video / Document Analysis
 - Translation (34 languages incl. Arabic)
 - Spoken Voice Replies (male or female)
+- Predictive Energy Management (/energy_status, /energy_forecast, /energy_report)
 
 **Status:** 🟢 Online and ready
     """
@@ -688,11 +731,11 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f = io.StringIO()
         with redirect_stdout(f):
             reconnaissance_prompt = f"Perform comprehensive target reconnaissance on {target}. Provide detailed information about the target's attack surface, technologies, infrastructure, and potential entry points."
-            response = await aget_reply(current_model, [{"role": "user", "content": reconnaissance_prompt}])
+            response = await aget_reply(COMMAND_MODEL, [{"role": "user", "content": reconnaissance_prompt}])
         return response
 
     try:
-        response = await asyncio.wait_for(do_scan(), timeout=60.0)
+        response = await asyncio.wait_for(do_scan(), timeout=CMD_TIMEOUT)
         conversation_history.append({"role": "user", "content": f"/scan {target}"})
         conversation_history.append({"role": "assistant", "content": response})
         auto_save(conversation_history, current_model)
@@ -717,11 +760,11 @@ async def cve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f = io.StringIO()
         with redirect_stdout(f):
             cve_prompt = f"Provide detailed analysis of {cve_id}: vulnerability description, affected systems, CVSS score, exploit availability, patch status, and mitigation strategies."
-            response = await aget_reply(current_model, [{"role": "user", "content": cve_prompt}])
+            response = await aget_reply(COMMAND_MODEL, [{"role": "user", "content": cve_prompt}])
         return response
 
     try:
-        response = await asyncio.wait_for(do_cve(), timeout=60.0)
+        response = await asyncio.wait_for(do_cve(), timeout=CMD_TIMEOUT)
         conversation_history.append({"role": "user", "content": f"/cve {cve_id}"})
         conversation_history.append({"role": "assistant", "content": response})
         auto_save(conversation_history, current_model)
@@ -746,11 +789,11 @@ async def exploit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f = io.StringIO()
         with redirect_stdout(f):
             exploit_prompt = f"Detail exploitation techniques, payloads, and bypass methods for {vuln_type} vulnerabilities. Include required tools, skill level, and effectiveness ratings."
-            response = await aget_reply(current_model, [{"role": "user", "content": exploit_prompt}])
+            response = await aget_reply(COMMAND_MODEL, [{"role": "user", "content": exploit_prompt}])
         return response
 
     try:
-        response = await asyncio.wait_for(do_exploit(), timeout=60.0)
+        response = await asyncio.wait_for(do_exploit(), timeout=CMD_TIMEOUT)
         conversation_history.append({"role": "user", "content": f"/exploit {vuln_type}"})
         conversation_history.append({"role": "assistant", "content": response})
         auto_save(conversation_history, current_model)
@@ -775,11 +818,11 @@ async def harden_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f = io.StringIO()
         with redirect_stdout(f):
             harden_prompt = f"Provide comprehensive security hardening recommendations for {system}. Include configuration changes, patch management, network segmentation, monitoring, and incident response improvements."
-            response = await aget_reply(current_model, [{"role": "user", "content": harden_prompt}])
+            response = await aget_reply(COMMAND_MODEL, [{"role": "user", "content": harden_prompt}])
         return response
 
     try:
-        response = await asyncio.wait_for(do_harden(), timeout=60.0)
+        response = await asyncio.wait_for(do_harden(), timeout=CMD_TIMEOUT)
         conversation_history.append({"role": "user", "content": f"/harden {system}"})
         conversation_history.append({"role": "assistant", "content": response})
         auto_save(conversation_history, current_model)
@@ -804,11 +847,11 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f = io.StringIO()
         with redirect_stdout(f):
             analyze_prompt = f"Conduct a complete 4-phase penetration test assessment on {target}:\\n1. Target Reconnaissance\\n2. Vulnerability Mapping (with severity)\\n3. Exploitation Plan\\n4. Remediation & Hardening Plan\\nProvide detailed, technical, and actionable findings for each phase."
-            response = await aget_reply(current_model, [{"role": "user", "content": analyze_prompt}])
+            response = await aget_reply(COMMAND_MODEL, [{"role": "user", "content": analyze_prompt}])
         return response
 
     try:
-        response = await asyncio.wait_for(do_analyze(), timeout=60.0)
+        response = await asyncio.wait_for(do_analyze(), timeout=CMD_TIMEOUT)
         conversation_history.append({"role": "user", "content": f"/analyze {target}"})
         conversation_history.append({"role": "assistant", "content": response})
         auto_save(conversation_history, current_model)
@@ -833,11 +876,11 @@ async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f = io.StringIO()
         with redirect_stdout(f):
             generate_prompt = f"Generate professional security content about {topic}. This could be a report, writeup, analysis, or documentation suitable for security professionals."
-            response = await aget_reply(current_model, [{"role": "user", "content": generate_prompt}])
+            response = await aget_reply(COMMAND_MODEL, [{"role": "user", "content": generate_prompt}])
         return response
 
     try:
-        response = await asyncio.wait_for(do_generate(), timeout=60.0)
+        response = await asyncio.wait_for(do_generate(), timeout=CMD_TIMEOUT)
         conversation_history.append({"role": "user", "content": f"/generate {topic}"})
         conversation_history.append({"role": "assistant", "content": response})
         auto_save(conversation_history, current_model)
@@ -862,11 +905,11 @@ async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f = io.StringIO()
         with redirect_stdout(f):
             scrape_prompt = f"Analyze the following text and extract key security-relevant information: indicators of compromise, vulnerabilities, attack patterns, or actionable intelligence:\\n\\n{text}"
-            response = await aget_reply(current_model, [{"role": "user", "content": scrape_prompt}])
+            response = await aget_reply(COMMAND_MODEL, [{"role": "user", "content": scrape_prompt}])
         return response
 
     try:
-        response = await asyncio.wait_for(do_scrape(), timeout=60.0)
+        response = await asyncio.wait_for(do_scrape(), timeout=CMD_TIMEOUT)
         conversation_history.append({"role": "user", "content": f"/scrape {text[:50]}..." if len(text) > 50 else f"/scrape {text}"})
         conversation_history.append({"role": "assistant", "content": response})
         auto_save(conversation_history, current_model)
@@ -993,7 +1036,7 @@ Provide:
 
 Format as a professional security report with clear, actionable steps."""
 
-                            ai_response = await aget_reply(current_model, [{"role": "user", "content": ai_prompt}])
+                            ai_response = await aget_reply(COMMAND_MODEL, [{"role": "user", "content": ai_prompt}])
 
                             all_data_classes = [item for b in detailed_breaches for item in b["DataClasses"]]
                             response = f"""🚨 **CONFIRMED BREACH DETECTION** - {target}
@@ -1190,7 +1233,7 @@ async def crypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return response
 
     try:
-        response = await asyncio.wait_for(do_crypto(), timeout=60.0)
+        response = await asyncio.wait_for(do_crypto(), timeout=CMD_TIMEOUT)
         conversation_history.append({"role": "user", "content": f"/crypto {symbol}"})
         conversation_history.append({"role": "assistant", "content": response})
         auto_save(conversation_history, current_model)
@@ -1228,11 +1271,11 @@ Include:
 
 Provide actionable insights for traders and investors. Use your elite security analysis mindset to identify potential market manipulation risks or unusual activity patterns."""
 
-            response = await aget_reply(current_model, [{"role": "user", "content": market_prompt}])
+            response = await aget_reply(COMMAND_MODEL, [{"role": "user", "content": market_prompt}])
             return response
 
     try:
-        response = await asyncio.wait_for(do_market(), timeout=60.0)
+        response = await asyncio.wait_for(do_market(), timeout=CMD_TIMEOUT)
         conversation_history.append({"role": "user", "content": f"/market {keyword}"})
         conversation_history.append({"role": "assistant", "content": response})
         auto_save(conversation_history, current_model)
@@ -1272,11 +1315,11 @@ Provide:
 
 Structure this as a professional intelligence report suitable for security teams and CISOs. Use clear, actionable language with specific details where possible."""
 
-            response = await aget_reply(current_model, [{"role": "user", "content": intel_prompt}])
+            response = await aget_reply(COMMAND_MODEL, [{"role": "user", "content": intel_prompt}])
             return response
 
     try:
-        response = await asyncio.wait_for(do_darkweb_intel(), timeout=60.0)
+        response = await asyncio.wait_for(do_darkweb_intel(), timeout=CMD_TIMEOUT)
         conversation_history.append({"role": "user", "content": f"/darkweb_intel {topic}"})
         conversation_history.append({"role": "assistant", "content": response})
         auto_save(conversation_history, current_model)
@@ -2276,7 +2319,7 @@ async def send_daily_briefing(bot):
             
             Format as brief, actionable intelligence bullets."""
             
-            threat_intel = await aget_reply(current_model, [{"role": "user", "content": threat_prompt}])
+            threat_intel = await aget_reply(COMMAND_MODEL, [{"role": "user", "content": threat_prompt}])
             threat_section = f"""🕵️‍♂️ **THREAT INTEL**
 {threat_intel}
                 """
@@ -2296,7 +2339,7 @@ async def send_daily_briefing(bot):
             
             Format as numbered list."""
             
-            defense_tips = await aget_reply(current_model, [{"role": "user", "content": defense_prompt}])
+            defense_tips = await aget_reply(COMMAND_MODEL, [{"role": "user", "content": defense_prompt}])
             defense_section = f"""🛡️ **ACTIONABLE DEFENSE**
 {defense_tips}
                 """
@@ -2381,6 +2424,7 @@ def setup_scheduler(application):
 import analytics as raven_analytics
 import content_creator
 import social_media_manager
+from energy_manager import get_store as get_energy_store
 from multi_provider_ai import ROUTER, RAVEN_SYSTEM_PROMPT, OLLAMA_TIMEOUT
 from trading_engine import TradingEngine
 
@@ -2966,6 +3010,245 @@ async def content_calendar_command(update: Update, context: ContextTypes.DEFAULT
         await send_long(update, f"❌ AI unavailable: {exc}")
         return
     await send_long(update, f"CONTENT CALENDAR · {platform.upper()}\n\n{text}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PREDICTIVE ENERGY MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════
+# The forecasting itself lives in energy_manager.py (pure stdlib: sqlite3
+# + math), so these commands reply in milliseconds - deliberately unlike
+# the model-backed commands, which need minutes of CPU per answer.
+
+_ENERGY_EMPTY = (
+    "No energy data yet. Start with one of:\n"
+    "/energy_demo [days] - synthetic month of hourly data\n"
+    "/energy_log <kWh> - log the current hour\n"
+    "/energy_import <file.csv> - timestamp,kwh columns (header optional)"
+)
+
+
+async def _energy_call(update: Update, func, *args):
+    """Run a blocking engine call off the event loop.
+
+    Returns the engine's result, or None after reporting the failure:
+    ValueError is user-facing input trouble (bad kWh, missing file, no
+    data), anything else is logged first.
+    """
+    try:
+        return await asyncio.to_thread(func, *args)
+    except ValueError as exc:
+        await send_long(update, f"❌ {exc}")
+    except Exception as exc:
+        logger.exception("energy command failed")
+        await send_long(update, f"❌ Energy engine error: {exc}")
+    return None
+
+
+async def energy_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /energy_status - totals, peak hour, week-over-week, anomalies."""
+    st = await _energy_call(update, get_energy_store().status)
+    if st is None:
+        return
+    if not st.get("n"):
+        await send_long(update, _ENERGY_EMPTY)
+        return
+    lines = [
+        "⚡ ENERGY STATUS",
+        "-" * 32,
+        f"Readings:  {st['n']} over {st['span_days']} days",
+        f"Last 7d:   {st['last7_total']} kWh"
+        + (f" ({st['wow_pct']:+.1f}% vs prior week)" if st["wow_pct"] is not None else ""),
+        f"Avg/day:   {st['avg_daily']} kWh" if st["avg_daily"] is not None
+        else "Avg/day:   n/a (no readings in the last 7 days)",
+        f"Peak hour: {st['peak_hour']:02d}:00 (highest typical load)",
+        f"Busiest:   {st['max'][0]:%a %d %H:%M} = {st['max'][1]} kWh",
+        f"Quietest:  {st['min'][0]:%a %d %H:%M} = {st['min'][1]} kWh",
+    ]
+    if st["anomalies"]:
+        lines.append(f"Anomalies: {len(st['anomalies'])} recent spike(s):")
+        for a in st["anomalies"]:
+            lines.append(
+                f"  {a['ts']:%a %d %H:%M}  {a['kwh']} kWh "
+                f"(expected {a['expected']}, {a['ratio']}x)"
+            )
+    else:
+        lines.append("Anomalies: none in the last 7 days")
+    await send_long(update, "```\n" + "\n".join(lines) + "\n```", parse_mode="Markdown")
+
+
+async def energy_forecast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /energy_forecast [hours] - hourly forecast, peak/valley windows."""
+    hours = 24
+    if context.args:
+        try:
+            hours = int(context.args[0])
+        except ValueError:
+            await send_long(update, "❌ Usage: /energy_forecast [hours] (1-336)")
+            return
+    fc = await _energy_call(update, get_energy_store().forecast, hours)
+    if fc is None:
+        return
+    lines = [
+        f"🔮 FORECAST · next {hours}h · confidence {fc['confidence'].upper()}",
+        "-" * 32,
+        f"Total: {fc['total']} kWh"
+        + (f" · ≈{fc['cost']} at your tariff" if "cost" in fc else ""),
+        f"Peak:   {fc['peak']['start']:%a %H:%M}-{fc['peak']['end']:%H:%M} "
+        f"({fc['peak']['kwh']} kWh)",
+        f"Valley: {fc['valley']['start']:%a %H:%M}-{fc['valley']['end']:%H:%M} "
+        f"({fc['valley']['kwh']} kWh)",
+        "",
+    ]
+    points = fc["points"]
+    if hours <= 48:
+        peak_v = max(v for _, v in points) or 1.0
+        for dt, v in points:
+            bars = "\u2588" * max(1, round(10 * v / peak_v)) if v > 0 else ""
+            lines.append(f"{dt:%H:%M} {bars:<10} {v:.2f}")
+    else:
+        lines.append("Highest hours:")
+        for dt, v in sorted(points, key=lambda p: -p[1])[:10]:
+            lines.append(f"  {dt:%a %H:%M}  {v:.2f} kWh")
+    await send_long(update, "```\n" + "\n".join(lines) + "\n```", parse_mode="Markdown")
+
+
+async def energy_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /energy_report - trends, load-shift advice, anomaly review."""
+    r = await _energy_call(update, get_energy_store().report, 24)
+    if r is None:
+        return
+    st = r["status"]
+    if not st.get("n"):
+        await send_long(update, _ENERGY_EMPTY)
+        return
+    fc = r["forecast"]
+    lines = [
+        "📊 ENERGY REPORT",
+        "-" * 32,
+        f"Data: {st['n']} readings / {r['span_days']} days · "
+        f"coverage {r['coverage_pct']}% · confidence {r['confidence'].upper()}",
+    ]
+    if r["trend_week_pct"] is not None:
+        lines.append(f"Trend: {r['trend_week_pct']:+.1f}% per week")
+    lines += [
+        f"Next 24h: {fc['total']} kWh" + (f" · ≈{fc['cost']}" if "cost" in fc else ""),
+        f"Peak {fc['peak']['start']:%H:%M}-{fc['peak']['end']:%H:%M} · "
+        f"Valley {fc['valley']['start']:%H:%M}-{fc['valley']['end']:%H:%M}",
+        "",
+        "Advice:",
+    ]
+    lines += [f"• {a}" for a in r["advice"]]
+    await send_long(update, "```\n" + "\n".join(lines) + "\n```", parse_mode="Markdown")
+
+
+async def energy_demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /energy_demo [days] - seed synthetic hourly meter data."""
+    days = 28
+    if context.args:
+        try:
+            days = max(7, min(90, int(context.args[0])))
+        except ValueError:
+            await send_long(update, "❌ Usage: /energy_demo [days] (7-90)")
+            return
+    store = get_energy_store()
+    added = await _energy_call(update, store.seed_demo, days)
+    if added is None:
+        return
+    st = await _energy_call(update, store.status) or {"n": 0}
+    await send_long(
+        update,
+        f"🧬 Demo data ready: {added} new readings ({days} days), "
+        f"{st.get('n', 0)} total.\nTry /energy_forecast or /energy_report.",
+    )
+
+
+async def energy_log_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /energy_log <kWh> [YYYY-MM-DD HH:MM] - log one reading."""
+    if not context.args:
+        await send_long(
+            update,
+            "❌ Usage: /energy_log <kWh> [YYYY-MM-DD HH:MM]\n"
+            "Example: /energy_log 1.4  (logs the current hour)",
+        )
+        return
+    ts = " ".join(context.args[1:]) or None
+    res = await _energy_call(update, get_energy_store().log_reading, context.args[0], ts)
+    if res is None:
+        return
+    key, value = res
+    await send_long(update, f"📝 Logged {value} kWh at {key[:16]}")
+
+
+async def energy_import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /energy_import <file.csv> - import timestamp,kwh rows."""
+    if not context.args:
+        await send_long(
+            update,
+            "❌ Usage: /energy_import <file.csv>\n"
+            "Columns: timestamp,kwh (header optional; bad rows are skipped)",
+        )
+        return
+    path = " ".join(context.args)
+    res = await _energy_call(update, get_energy_store().import_csv, path)
+    if res is None:
+        return
+    msg = f"📥 Imported {res['imported']}/{res['rows']} rows"
+    if res["skipped"]:
+        msg += f" (skipped {res['skipped']})"
+    await send_long(update, msg + ".")
+
+
+async def energy_tariff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /energy_tariff [peak offpeak HH-HH] - show or set cost rates."""
+    store = get_energy_store()
+    if not context.args:
+        t = await _energy_call(update, store.get_tariff)
+        if t is None:
+            return
+        if not t:
+            await send_long(
+                update,
+                "No tariff configured. Set rates per kWh:\n"
+                "/energy_tariff 0.50 0.15 17-23\n"
+                "(peak 17:00-23:00 at 0.50, everything else 0.15)",
+            )
+            return
+        await send_long(
+            update,
+            f"💰 Tariff: peak {t['peak_rate']}/kWh "
+            f"{t['peak_start']:02d}:00-{t['peak_end']:02d}:00 · "
+            f"off-peak {t['offpeak_rate']}/kWh",
+        )
+        return
+    usage = "❌ Usage: /energy_tariff <peak_rate> <offpeak_rate> <HH-HH>\ne.g. /energy_tariff 0.50 0.15 17-23"
+    if len(context.args) < 3 or "-" not in context.args[2]:
+        await send_long(update, usage)
+        return
+    start_hour, end_hour = context.args[2].split("-", 1)
+    res = await _energy_call(
+        update, store.set_tariff, context.args[0], context.args[1],
+        start_hour, end_hour,
+    )
+    if res is None:
+        return
+    await send_long(
+        update,
+        f"💰 Tariff set: peak {res['peak_rate']}/kWh "
+        f"{res['peak_start']:02d}:00-{res['peak_end']:02d}:00 · "
+        f"off-peak {res['offpeak_rate']}/kWh\n"
+        "Forecast and report now include cost projections.",
+    )
+
+
+async def energy_clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /energy_clear - erase all readings (admin only)."""
+    if not is_admin(update.effective_user.id):
+        await send_long(update, "⛔ Admin only.")
+        return
+    count = await _energy_call(update, get_energy_store().clear_readings)
+    if count is None:
+        return
+    await send_long(update, f"🗑 Erased {count} readings (tariff settings kept).")
 
 
 async def post_init(application):
@@ -5122,6 +5405,16 @@ def main():
     application.add_handler(CommandHandler("social_guide", social_guide_command))
     application.add_handler(CommandHandler("create_content", create_content_command))
     application.add_handler(CommandHandler("content_calendar", content_calendar_command))
+
+    # Predictive Energy Management - local forecasting, no LLM round trip
+    application.add_handler(CommandHandler("energy_status", energy_status_command))
+    application.add_handler(CommandHandler("energy_forecast", energy_forecast_command))
+    application.add_handler(CommandHandler("energy_report", energy_report_command))
+    application.add_handler(CommandHandler("energy_demo", energy_demo_command))
+    application.add_handler(CommandHandler("energy_log", energy_log_command))
+    application.add_handler(CommandHandler("energy_import", energy_import_command))
+    application.add_handler(CommandHandler("energy_tariff", energy_tariff_command))
+    application.add_handler(CommandHandler("energy_clear", energy_clear_command))
 
     # SaaS tiers, quota visibility and plan information
     if SAAS_AVAILABLE:

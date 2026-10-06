@@ -26,6 +26,15 @@ RETRY_DELAY = 2
 KEEP_ALIVE = os.getenv("RAVEN_KEEP_ALIVE", "30m").strip()
 _KA_OPTS = {"keep_alive": KEEP_ALIVE} if KEEP_ALIVE else {}
 
+# Hard cap on generated tokens per reply. Without it ollama runs until the
+# model emits EOS, and dolphin-llama3:8b rambled for 376 tokens once = 8m14s
+# of generation at ~0.8 tok/s, a 9m58s round trip that landed 2s short of the
+# bot's 600s timeout. 300 tokens keeps the worst case (load 130s + prefill
+# 45s + 300 tokens ~395s) under 600s with margin. RAVEN_MAX_TOKENS=0 disables
+# the cap; the bot's .env sets 300 explicitly.
+MAX_TOKENS = int((os.getenv("RAVEN_MAX_TOKENS", "300").strip() or "300"))
+_OPTS = {"num_predict": MAX_TOKENS} if MAX_TOKENS > 0 else {}
+
 # The canonical prompt, imported rather than redefined here. This module used to
 # carry its own copy that dropped the mandated 4-phase output format, so the CLI
 # and the Telegram bot answered the same question in different shapes. Both read
@@ -219,7 +228,7 @@ def get_reply(model, messages, stream=False):
         try:
             if stream:
                 response = ollama.chat(model=model, messages=messages,
-                                       stream=True, **_KA_OPTS)
+                                       stream=True, options=_OPTS, **_KA_OPTS)
                 print("\nRAVEN: ", end="", flush=True)
                 reply = ""
                 for chunk in response:
@@ -230,7 +239,7 @@ def get_reply(model, messages, stream=False):
                 return reply
             else:
                 response = ollama.chat(model=model, messages=messages,
-                                       stream=False, **_KA_OPTS)
+                                       stream=False, options=_OPTS, **_KA_OPTS)
                 reply = response["message"]["content"]
                 print(f"\nRAVEN: {reply}")
                 return reply
