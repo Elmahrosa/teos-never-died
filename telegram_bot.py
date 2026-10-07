@@ -1414,6 +1414,9 @@ async def _agent_respond(update: Update, prompt: str):
     """
     placeholder = await update.message.reply_text(
         "\U0001f9e0 RAVEN is searching the web\u2026")
+    logger.info("agent respond start from=%s query=%r",
+                update.effective_user.id if update.effective_user else "?",
+                prompt[:120])
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -1459,6 +1462,10 @@ async def _agent_respond(update: Update, prompt: str):
         await placeholder.delete()
     except Exception:
         pass
+    logger.info("agent respond done from=%s rounds=%s web_used=%s warning=%r",
+                update.effective_user.id if update.effective_user else "?",
+                final.get("rounds"), final.get("web_used"),
+                final.get("warning"))
     text = agent_engine._agent_reply_text(final)
     await send_long(update, text)
     if text:
@@ -3416,6 +3423,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning("search command failed: %s", exc)
         await msg.edit_text(f"❌ Search failed: {exc}")
         return
+    logger.info("search command query=%r -> %d results", query, len(results))
     if not results:
         await msg.edit_text("🔍 No results found for that query.")
         return

@@ -14,11 +14,14 @@ bot can run it inside asyncio.to_thread. progress_cb is invoked from the
 worker thread and the caller must marshal it back to the event loop.
 """
 
+import logging
 import os
 import re
 
 import raven
 import web_search
+
+logger = logging.getLogger("raven.agent")
 
 DEFAULT_FAST_MODEL = (os.getenv("RAVEN_MODEL", "llama3.2:3b").strip()
                       or "llama3.2:3b")
@@ -234,6 +237,8 @@ def run_agent(query, max_rounds=None, progress_cb=None,
         plan = ""
         warning = f"planning failed ({exc})"
     queries = _extract_queries(plan)[:3] or [query]
+    logger.info("agent plan query=%r -> %d queries: %s",
+                query[:120], len(queries), queries)
 
     pending = None
     for rnd in range(1, max_rounds + 1):
@@ -244,6 +249,9 @@ def run_agent(query, max_rounds=None, progress_cb=None,
         if serr and not warning:
             warning = serr
         used = _merge_results(used, fresh)
+        logger.info("agent round %d searched %s -> %d fresh, %d used total%s",
+                    rnd, round_queries, len(fresh), len(used),
+                    f" (warning: {serr})" if serr else "")
 
         if rnd > 1 or pending:
             progress("\U0001f4c4 reading source pages\u2026")
@@ -274,6 +282,9 @@ def run_agent(query, max_rounds=None, progress_cb=None,
         )
         if warning:
             final += f"\nDetail: {warning}"
+
+    logger.info("agent finished query=%r rounds=%d web_used=%s warning=%r",
+                query[:120], rounds_done, bool(used), warning)
 
     sources = []
     for i, r in enumerate(used, 1):
