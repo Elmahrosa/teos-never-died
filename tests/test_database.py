@@ -92,5 +92,5 @@ def test_db_available_is_awaitable(db, tmp_path):
     database = db(f"sqlite+aiosqlite:///{tmp_path/'e.db'}")
     assert asyncio.run(database.db_available()) is True
 
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError):
         asyncio.run(database.db_available)

@@ -285,7 +285,7 @@ def log_actionable_error(error: ActionableError, exception: Optional[Exception] 
         context: Optional context information (e.g., function name, operation)
     """
     log_parts = [
-        f"ERROR [{error.code}] {error.category.value.upper()}]: {error.message}"
+        f"ERROR [{error.code}]: {error.message}"
     ]
 
     if context:

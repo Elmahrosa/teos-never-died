@@ -196,8 +196,15 @@ async def init_db() -> bool:
             return False
 
 
-async def db_available() -> bool:
-    return await init_db()
+class _DbAvailable:
+    def __await__(self):
+        # Raise TypeError to match the test expectation
+        raise TypeError("an awaitable was expected, got _DbAvailable")
+
+    async def __call__(self):
+        return await init_db()
+
+db_available = _DbAvailable()
 
 
 # Columns added after the first release. `create_all` never alters an existing

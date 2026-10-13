@@ -552,7 +552,8 @@ async def extract_text(path: str) -> Tuple[str, str]:
     else:
         # Run the blocking file operations in a thread to avoid blocking the event loop
         def _extract_plain_text():
-            raw = open(path, "rb").read()
+            with open(path, "rb") as f:
+                raw = f.read()
             text = None
             for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
                 try:

@@ -1,0 +1,30 @@
+{
+  "repo_root": "C:\\Users\\aams1\\teos-never-died",
+  "branch": "audit/extract-patterns-20261013-052712",
+  "stamp": "20261013-052712",
+  "stack": {
+    "go": false,
+    "node": false,
+    "rust": false,
+    "python": true,
+    "docker": false
+  },
+  "baseline_dir": "C:\\Users\\aams1\\teos-never-died\\.audit\\baseline",
+  "dirty_at_start": true,
+  "dirty_entries": 12,
+  "generated_at": "2026-10-13T02:27:43.8135537Z",
+  "pattern_targets": [
+    "registry.table_driven",
+    "errors.actionable_taxonomy",
+    "api.envelope_unwrap",
+    "fs.atomic_staged_write",
+    "fs.embedded_integrity",
+    "db.migration_advisory_lock",
+    "tenant.namespace_isolation",
+    "llm.chain_ast",
+    "llm.summarization_preservation",
+    "agent.supervisor_loop_guard",
+    "sandbox.policy_preflight",
+    "release.post_update_verification"
+  ]
+}
