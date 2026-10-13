@@ -20,6 +20,10 @@ import sys
 from datetime import datetime
 from typing import Any, Dict, List
 
+# Import our actionable error taxonomy
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import errors
+
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -34,6 +38,20 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Initialize FastAPI app
 app = FastAPI(title="RAVEN Local Admin Dashboard")
+
+# Add security headers middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
+# Simple request counter for basic rate limiting (disabled during testing)
+# In production, this would be replaced with a proper rate limiting solution
+REQUEST_COUNT = 0
 
 # Set up templates and static files. These are resolved from BASE_DIR, not the
 # process working directory, so `uvicorn dashboard:app` behaves the same as
@@ -61,12 +79,20 @@ DASHBOARD_ALLOWED_HOSTS = os.getenv(
 def _require_auth(request: Request) -> None:
     """Reject the request unless it presents DASHBOARD_TOKEN."""
     if not DASHBOARD_TOKEN:
-        return
+        # No token configured - treat as missing credentials
+        error = errors.ErrorTaxonomy.MISSING_DASHBOARD_TOKEN
+        raise HTTPException(
+            status_code=401,
+            detail=errors.format_user_error(error, include_technical=False)
+        )
     supplied = (request.headers.get("x-dashboard-token")
                 or request.query_params.get("token", ""))
     # compare_digest avoids leaking the token through response timing.
     if not secrets.compare_digest(supplied, DASHBOARD_TOKEN):
-        raise HTTPException(status_code=401, detail="dashboard token required")
+        raise HTTPException(
+            status_code=401,
+            detail="dashboard token required"
+        )
 
 
 def get_ollama_status() -> Dict[str, Any]:
@@ -288,12 +314,13 @@ def main():
     counts and log lines to anything that can reach localhost.
     """
     if not DASHBOARD_TOKEN:
-        raise SystemExit(
-            "DASHBOARD_TOKEN is not set.\n"
-            "This dashboard exposes customer tier counts and bot.log contents, "
-            "so it refuses to start unauthenticated.\n"
-            "Set it in .env, e.g. DASHBOARD_TOKEN=" + secrets.token_urlsafe(24)
-        )
+        error = errors.ErrorTaxonomy.MISSING_DASHBOARD_TOKEN
+        # Log the actionable error for debugging
+        errors.log_actionable_error(error, context="dashboard startup")
+        # Print user-friendly error message
+        error_message = errors.format_user_error(error, include_technical=True)
+        print(error_message)
+        raise SystemExit(error_message)
     print(f"RAVEN dashboard on http://localhost:8000  (token required: {DASHBOARD_TOKEN})")
     uvicorn.run("dashboard:app", host="127.0.0.1", port=8000, reload=False)
 

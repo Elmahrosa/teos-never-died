@@ -62,6 +62,23 @@ except Exception as _saas_import_error:  # pragma: no cover
     translator = None
     voice_engine = None
     SAAS_AVAILABLE = False
+    # Use actionable error for missing SaaS/multimodal modules
+    error = errors.ActionableError(
+        category=errors.ErrorCategory.EXTERNAL_SERVICE,
+        code="RAVEN-910",
+        message="SaaS/multimodal modules unavailable",
+        user_guidance=[
+            "Install required dependencies: pip install python-telegram-bot",
+            "For multimodal features: pip install torch torchvision transformers",
+            "For translation: pip install translate",
+            "For voice features: pip install SpeechRecognition pydub",
+            "For scheduled features: pip install APScheduler",
+            "For HIBP API: pip install requests",
+            "For crypto features: pip install ccxt"
+        ],
+        technical_details={"import_error": str(_saas_import_error)}
+    )
+    errors.log_actionable_error(error, context="SaaS/multimodal modules import")
     logging.getLogger("raven.bot").error(
         "SaaS/multimodal modules unavailable: %s", _saas_import_error)
 
@@ -69,41 +86,106 @@ except Exception as _saas_import_error:  # pragma: no cover
 try:
     import ccxt
     CCXT_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     CCXT_AVAILABLE = False
     ccxt = None
+    # Use actionable error for missing ccxt module
+    error = errors.ActionableError(
+        category=errors.ErrorCategory.EXTERNAL_SERVICE,
+        code="RAVEN-911",
+        message="CCXT module not available for crypto functionality",
+        user_guidance=[
+            "Install CCXT for crypto features: pip install ccxt",
+            "CCXT provides access to cryptocurrency exchange data",
+            "Without this module, /crypto and related commands will not work"
+        ],
+        technical_details={"import_error": str(e)}
+    )
+    errors.log_actionable_error(error, context="CCXT import")
 
 # Try to import requests for HIBP API
 try:
     import requests
     REQUESTS_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     REQUESTS_AVAILABLE = False
     requests = None
+    # Use actionable error for missing requests module
+    error = errors.ActionableError(
+        category=errors.ErrorCategory.EXTERNAL_SERVICE,
+        code="RAVEN-912",
+        message="Requests module not available for HIBP API functionality",
+        user_guidance=[
+            "Install requests for HIBP API features: pip install requests",
+            "The requests module is needed for Have I Been Pwned API integration",
+            "Without this module, /leak and related breach detection commands will not work"
+        ],
+        technical_details={"import_error": str(e)}
+    )
+    errors.log_actionable_error(error, context="Requests import")
 
 # Try to import speech_recognition for voice commands
 try:
     import speech_recognition as sr
     SPEECH_RECOGNITION_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     SPEECH_RECOGNITION_AVAILABLE = False
     sr = None
+    # Use actionable error for missing speech_recognition module
+    error = errors.ActionableError(
+        category=errors.ErrorCategory.EXTERNAL_SERVICE,
+        code="RAVEN-913",
+        message="SpeechRecognition module not available for voice command functionality",
+        user_guidance=[
+            "Install SpeechRecognition for voice features: pip install SpeechRecognition",
+            "This module enables voice command processing and transcription",
+            "Without this module, voice commands will not work"
+        ],
+        technical_details={"import_error": str(e)}
+    )
+    errors.log_actionable_error(error, context="SpeechRecognition import")
 
 # Try to import pydub for audio processing
 try:
     from pydub import AudioSegment
     PYDUB_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     PYDUB_AVAILABLE = False
     AudioSegment = None
+    # Use actionable error for missing pydub module
+    error = errors.ActionableError(
+        category=errors.ErrorCategory.EXTERNAL_SERVICE,
+        code="RAVEN-914",
+        message="Pydub module not available for audio processing functionality",
+        user_guidance=[
+            "Install pydub for audio processing: pip install pydub",
+            "This module is needed for audio format conversion in voice command processing",
+            "Without this module, voice commands that require audio processing will not work"
+        ],
+        technical_details={"import_error": str(e)}
+    )
+    errors.log_actionable_error(error, context="Pydub import")
 
 # Try to import APScheduler for scheduled jobs
 try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     APSCHEDULER_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     APSCHEDULER_AVAILABLE = False
     AsyncIOScheduler = None
+    # Use actionable error for missing APScheduler module
+    error = errors.ActionableError(
+        category=errors.ErrorCategory.EXTERNAL_SERVICE,
+        code="RAVEN-915",
+        message="APScheduler module not available for scheduled job functionality",
+        user_guidance=[
+            "Install APScheduler for scheduled jobs: pip install APScheduler",
+            "This module enables automated daily briefings and other scheduled tasks",
+            "Without this module, /daily_briefing and related scheduled features will not work"
+        ],
+        technical_details={"import_error": str(e)}
+    )
+    errors.log_actionable_error(error, context="APScheduler import")
 
 # Enable logging - console plus bot.log so failures stay inspectable
 # after the launcher window closes.
@@ -748,10 +830,38 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
         await send_long(update, f"🎯 **Reconnaissance Results for {target}:**\n\n{response}", parse_mode='Markdown')
     except asyncio.TimeoutError:
+        # Use actionable error for command timeout
+        error = errors.ActionableError(
+            category=errors.ErrorCategory.NETWORK,
+            code="RAVEN-920",
+            message=f"Command timeout after {CMD_TIMEOUT} seconds",
+            user_guidance=[
+                "The operation took too long to complete",
+                "Try again with a simpler or more specific target",
+                "Check your network connection if the target is a remote host",
+                "Consider increasing RAVEN_CMD_TIMEOUT in your .env if legitimate operations need more time"
+            ],
+            technical_details={"timeout_seconds": CMD_TIMEOUT, "target": target}
+        )
         await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+        await send_long(update, errors.format_user_error(error, include_technical=False), parse_mode='Markdown')
+        errors.log_actionable_error(error, context=f"scan command timeout for {target}")
     except Exception as e:
+        # Use actionable error for general command failure
+        error = errors.ActionableError(
+            category=errors.ErrorCategory.EXTERNAL_SERVICE,
+            code="RAVEN-921",
+            message="Command execution failed",
+            user_guidance=[
+                "An unexpected error occurred during command execution",
+                "Please try again or check the logs for more details",
+                "If the problem persists, try restarting the bot"
+            ],
+            technical_details={"error_type": type(e).__name__, "error_message": str(e), "target": target}
+        )
         await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
-        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
+        await send_long(update, errors.format_user_error(error, include_technical=False), parse_mode='Markdown')
+        errors.log_actionable_error(error, context=f"scan command exception for {target}", exception=e)
 
 async def cve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /cve command."""
@@ -777,10 +887,38 @@ async def cve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
         await send_long(update, f"🐛 **CVE Analysis for {cve_id}:**\n\n{response}", parse_mode='Markdown')
     except asyncio.TimeoutError:
+        # Use actionable error for command timeout
+        error = errors.ActionableError(
+            category=errors.ErrorCategory.NETWORK,
+            code="RAVEN-922",
+            message=f"Command timeout after {CMD_TIMEOUT} seconds",
+            user_guidance=[
+                "The operation took too long to complete",
+                "Try again with a simpler or more specific CVE ID",
+                "Check your network connection if querying remote CVE databases",
+                "Consider increasing RAVEN_CMD_TIMEOUT in your .env if legitimate operations need more time"
+            ],
+            technical_details={"timeout_seconds": CMD_TIMEOUT, "cve_id": cve_id}
+        )
         await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+        await send_long(update, errors.format_user_error(error, include_technical=False), parse_mode='Markdown')
+        errors.log_actionable_error(error, context=f"cve command timeout for {cve_id}")
     except Exception as e:
+        # Use actionable error for general command failure
+        error = errors.ActionableError(
+            category=errors.ErrorCategory.EXTERNAL_SERVICE,
+            code="RAVEN-923",
+            message="Command execution failed",
+            user_guidance=[
+                "An unexpected error occurred during command execution",
+                "Please try again or check the logs for more details",
+                "If the problem persists, try restarting the bot"
+            ],
+            technical_details={"error_type": type(e).__name__, "error_message": str(e), "cve_id": cve_id}
+        )
         await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
-        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
+        await send_long(update, errors.format_user_error(error, include_technical=False), parse_mode='Markdown')
+        errors.log_actionable_error(error, context=f"cve command exception for {cve_id}", exception=e)
 
 async def exploit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /exploit command."""
@@ -806,10 +944,38 @@ async def exploit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
         await send_long(update, f"⚡ **Exploitation Techniques for {vuln_type}:**\n\n{response}", parse_mode='Markdown')
     except asyncio.TimeoutError:
+        # Use actionable error for command timeout
+        error = errors.ActionableError(
+            category=errors.ErrorCategory.NETWORK,
+            code="RAVEN-924",
+            message=f"Command timeout after {CMD_TIMEOUT} seconds",
+            user_guidance=[
+                "The operation took too long to complete",
+                "Try again with a simpler or more specific vulnerability type",
+                "Check your network connection if querying remote exploit databases",
+                "Consider increasing RAVEN_CMD_TIMEOUT in your .env if legitimate operations need more time"
+            ],
+            technical_details={"timeout_seconds": CMD_TIMEOUT, "vuln_type": vuln_type}
+        )
         await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+        await send_long(update, errors.format_user_error(error, include_technical=False), parse_mode='Markdown')
+        errors.log_actionable_error(error, context=f"exploit command timeout for {vuln_type}")
     except Exception as e:
+        # Use actionable error for general command failure
+        error = errors.ActionableError(
+            category=errors.ErrorCategory.EXTERNAL_SERVICE,
+            code="RAVEN-925",
+            message="Command execution failed",
+            user_guidance=[
+                "An unexpected error occurred during command execution",
+                "Please try again or check the logs for more details",
+                "If the problem persists, try restarting the bot"
+            ],
+            technical_details={"error_type": type(e).__name__, "error_message": str(e), "vuln_type": vuln_type}
+        )
         await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
-        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
+        await send_long(update, errors.format_user_error(error, include_technical=False), parse_mode='Markdown')
+        errors.log_actionable_error(error, context=f"exploit command exception for {vuln_type}", exception=e)
 
 async def harden_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /harden command."""
@@ -835,10 +1001,38 @@ async def harden_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
         await send_long(update, f"🛡️ **Hardening Recommendations for {system}:**\n\n{response}", parse_mode='Markdown')
     except asyncio.TimeoutError:
+        # Use actionable error for command timeout
+        error = errors.ActionableError(
+            category=errors.ErrorCategory.NETWORK,
+            code="RAVEN-926",
+            message=f"Command timeout after {CMD_TIMEOUT} seconds",
+            user_guidance=[
+                "The operation took too long to complete",
+                "Try again with a simpler or more specific system target",
+                "Check your network connection if querying remote hardening guidelines",
+                "Consider increasing RAVEN_CMD_TIMEOUT in your .env if legitimate operations need more time"
+            ],
+            technical_details={"timeout_seconds": CMD_TIMEOUT, "system": system}
+        )
         await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+        await send_long(update, errors.format_user_error(error, include_technical=False), parse_mode='Markdown')
+        errors.log_actionable_error(error, context=f"harden command timeout for {system}")
     except Exception as e:
+        # Use actionable error for general command failure
+        error = errors.ActionableError(
+            category=errors.ErrorCategory.EXTERNAL_SERVICE,
+            code="RAVEN-927",
+            message="Command execution failed",
+            user_guidance=[
+                "An unexpected error occurred during command execution",
+                "Please try again or check the logs for more details",
+                "If the problem persists, try restarting the bot"
+            ],
+            technical_details={"error_type": type(e).__name__, "error_message": str(e), "system": system}
+        )
         await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
-        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
+        await send_long(update, errors.format_user_error(error, include_technical=False), parse_mode='Markdown')
+        errors.log_actionable_error(error, context=f"harden command exception for {system}", exception=e)
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /analyze command - triggers full 4-phase pentest report."""
@@ -864,10 +1058,38 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
         await send_long(update, f"📋 **Full 4-Phase Penetration Test Report for {target}:**\n\n{response}", parse_mode='Markdown')
     except asyncio.TimeoutError:
+        # Use actionable error for command timeout
+        error = errors.ActionableError(
+            category=errors.ErrorCategory.NETWORK,
+            code="RAVEN-928",
+            message=f"Command timeout after {CMD_TIMEOUT} seconds",
+            user_guidance=[
+                "The operation took too long to complete",
+                "Try again with a simpler or more specific target",
+                "Check your network connection if the target is a remote host",
+                "Consider increasing RAVEN_CMD_TIMEOUT in your .env if legitimate operations need more time"
+            ],
+            technical_details={"timeout_seconds": CMD_TIMEOUT, "target": target}
+        )
         await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+        await send_long(update, errors.format_user_error(error, include_technical=False), parse_mode='Markdown')
+        errors.log_actionable_error(error, context=f"analyze command timeout for {target}")
     except Exception as e:
+        # Use actionable error for general command failure
+        error = errors.ActionableError(
+            category=errors.ErrorCategory.EXTERNAL_SERVICE,
+            code="RAVEN-929",
+            message="Command execution failed",
+            user_guidance=[
+                "An unexpected error occurred during command execution",
+                "Please try again or check the logs for more details",
+                "If the problem persists, try restarting the bot"
+            ],
+            technical_details={"error_type": type(e).__name__, "error_message": str(e), "target": target}
+        )
         await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
-        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
+        await send_long(update, errors.format_user_error(error, include_technical=False), parse_mode='Markdown')
+        errors.log_actionable_error(error, context=f"analyze command exception for {target}", exception=e)
 
 async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /generate command."""
@@ -893,10 +1115,38 @@ async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
         await send_long(update, f"📄 **Generated Content on {topic}:**\n\n{response}", parse_mode='Markdown')
     except asyncio.TimeoutError:
+        # Use actionable error for command timeout
+        error = errors.ActionableError(
+            category=errors.ErrorCategory.NETWORK,
+            code="RAVEN-930",
+            message=f"Command timeout after {CMD_TIMEOUT} seconds",
+            user_guidance=[
+                "The operation took too long to complete",
+                "Try again with a simpler or more specific topic",
+                "Check your network connection if querying remote sources",
+                "Consider increasing RAVEN_CMD_TIMEOUT in your .env if legitimate operations need more time"
+            ],
+            technical_details={"timeout_seconds": CMD_TIMEOUT, "topic": topic}
+        )
         await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+        await send_long(update, errors.format_user_error(error, include_technical=False), parse_mode='Markdown')
+        errors.log_actionable_error(error, context=f"generate command timeout for {topic}")
     except Exception as e:
+        # Use actionable error for general command failure
+        error = errors.ActionableError(
+            category=errors.ErrorCategory.EXTERNAL_SERVICE,
+            code="RAVEN-931",
+            message="Command execution failed",
+            user_guidance=[
+                "An unexpected error occurred during command execution",
+                "Please try again or check the logs for more details",
+                "If the problem persists, try restarting the bot"
+            ],
+            technical_details={"error_type": type(e).__name__, "error_message": str(e), "topic": topic}
+        )
         await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
-        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
+        await send_long(update, errors.format_user_error(error, include_technical=False), parse_mode='Markdown')
+        errors.log_actionable_error(error, context=f"generate command exception for {topic}", exception=e)
 
 async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /scrape command."""
@@ -922,10 +1172,38 @@ async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await loading_msg.edit_text("🛡 SENTINEL RESULT", parse_mode='Markdown')
         await send_long(update, f"🔎 **Extracted Information:**\n\n{response}", parse_mode='Markdown')
     except asyncio.TimeoutError:
+        # Use actionable error for command timeout
+        error = errors.ActionableError(
+            category=errors.ErrorCategory.NETWORK,
+            code="RAVEN-932",
+            message=f"Command timeout after {CMD_TIMEOUT} seconds",
+            user_guidance=[
+                "The operation took too long to complete",
+                "Try again with shorter or simpler text to scrape",
+                "Check your network connection if querying remote sources",
+                "Consider increasing RAVEN_CMD_TIMEOUT in your .env if legitimate operations need more time"
+            ],
+            technical_details={"timeout_seconds": CMD_TIMEOUT, "text_preview": text[:50] if len(text) > 50 else text}
+        )
         await loading_msg.edit_text("❌ Request failed: timeout", parse_mode='Markdown')
+        await send_long(update, errors.format_user_error(error, include_technical=False), parse_mode='Markdown')
+        errors.log_actionable_error(error, context=f"scrape command timeout for text preview: {text[:50] if len(text) > 50 else text}")
     except Exception as e:
+        # Use actionable error for general command failure
+        error = errors.ActionableError(
+            category=errors.ErrorCategory.EXTERNAL_SERVICE,
+            code="RAVEN-933",
+            message="Command execution failed",
+            user_guidance=[
+                "An unexpected error occurred during command execution",
+                "Please try again or check the logs for more details",
+                "If the problem persists, try restarting the bot"
+            ],
+            technical_details={"error_type": type(e).__name__, "error_message": str(e), "text_preview": text[:50] if len(text) > 50 else text}
+        )
         await loading_msg.edit_text("❌ Request failed", parse_mode='Markdown')
-        await send_long(update, f"Error: {str(e)}", parse_mode='Markdown')
+        await send_long(update, errors.format_user_error(error, include_technical=False), parse_mode='Markdown')
+        errors.log_actionable_error(error, context=f"scrape command exception for text preview: {text[:50] if len(text) > 50 else text}", exception=e)
 
 # MODULE A: REAL BREACH DATA (/leak command with HIBP API)
 
@@ -2555,20 +2833,20 @@ RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 def is_admin(user_id: int) -> bool:
     """Return True if the user is the configured admin.
 
-    If ADMIN_USER_ID is unset the bot is open (single-user local setup);
-    a warning is logged once so the owner knows the gate is disabled.
+    If ADMIN_USER_ID is unset the bot is closed (no user is privileged);
+    an error is logged so the owner knows the gate is enabled.
 
     The configured value is normalised first. It is routinely pasted out of a
     chat bubble as "(12345)" or "[12345]", and the stray bracket used to make
     this compare against "12345)" - which silently refused /buy, /sell,
-    /trade_mode, /emergency_stop and /resume for the owner, with no obvious
+    /trade_mode /emergency_stop and /resume for the owner, with no obvious
     cause. A malformed value now logs loudly and fails closed rather than
     quietly denying everything.
     """
     admin_id = os.getenv("ADMIN_USER_ID", "").strip()
     if not admin_id:
-        logger.warning("ADMIN_USER_ID not set - privileged commands are open to all users")
-        return True
+        logger.error("ADMIN_USER_ID not set - privileged commands are refused to all users")
+        return False
     cleaned = admin_id.strip("()[]{}<> \t\"'")
     if not cleaned.isdigit():
         logger.error(

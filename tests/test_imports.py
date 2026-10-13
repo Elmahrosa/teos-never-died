@@ -39,6 +39,7 @@ MODULES = [
     "dashboard",
     "telegram_bot",
     "webhook_server",
+    "errors",
 ]
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

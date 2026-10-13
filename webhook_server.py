@@ -48,6 +48,9 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from dotenv import load_dotenv
 
+# Import our actionable error taxonomy
+import errors
+
 # FIX 1: Load environment variables so WEBHOOK_SECRET and TELEGRAM_TOKEN are visible
 load_dotenv()
 
@@ -394,17 +397,88 @@ if _HAVE_FASTAPI:
         signature = dodo_signature or x_webhook_signature
         if signature:
             valid, why = verify_signature(body, signature)
+            # Map specific signature errors to actionable errors
+            if not valid:
+                if why == "no webhook secret configured":
+                    error = errors.ErrorTaxonomy.MISSING_DASHBOARD_TOKEN  # Reusing similar concept
+                    # Actually, let's create a more specific one for webhook
+                    error = errors.ActionableError(
+                        category=errors.ErrorCategory.CONFIGURATION,
+                        code="RAVEN-903",
+                        message="Webhook secret not configured",
+                        user_guidance=[
+                            "Set the WEBHOOK_SECRET or PAYMENT_WEBHOOK_SECRET environment variable in your .env file",
+                            "Generate a secure secret using: python -c \"import secrets; print(secrets.token_urlsafe(32))\"",
+                            "Restart the webhook server after setting the secret"
+                        ]
+                    )
+                    error_message = errors.format_user_error(error, include_technical=False)
+                elif "timestamp outside" in why:
+                    error = errors.ActionableError(
+                        category=errors.ErrorCategory.NETWORK,
+                        code="RAVEN-904",
+                        message="Webhook timestamp validation failed",
+                        user_guidance=[
+                            "Ensure your system clock is synchronized with NTP",
+                            "Check that the webhook sender's clock is also synchronized",
+                            "Verify the PAYMENT_WEBHOOK_TOLERANCE setting is appropriate for your network conditions"
+                        ],
+                        technical_details={"validation_error": why}
+                    )
+                    error_message = errors.format_user_error(error, include_technical=False)
+                elif why == "missing signature header":
+                    error = errors.ActionableError(
+                        category=errors.ErrorCategory.VALIDATION,
+                        code="RAVEN-905",
+                        message="Missing webhook signature header",
+                        user_guidance=[
+                            "Configure your webhook provider to send signature headers",
+                            "For Svix-style webhooks, ensure 't=<timestamp>,v1=<signature>' header is included",
+                            "For simple HMAC webhooks, ensure the raw HMAC-SHA256 is sent as a header"
+                        ]
+                    )
+                    error_message = errors.format_user_error(error, include_technical=False)
+                else:
+                    # Generic signature mismatch or other error
+                    error_message = why
+            else:
+                error_message = None
         elif x_raven_secret:
             # Shared-secret fallback for providers that only offer a static
             # bearer token. Still constant-time.
             valid = hmac.compare_digest(x_raven_secret, WEBHOOK_SECRET)
             why = "ok" if valid else "secret mismatch"
+            if not valid:
+                error = errors.ActionableError(
+                    category=errors.ErrorCategory.CONFIGURATION,
+                    code="RAVEN-906",
+                    message="Webhook secret mismatch",
+                    user_guidance=[
+                        "Verify that the X-RAVEN-SECRET header matches the WEBHOOK_SECRET in your .env file",
+                        "Check for any extra whitespace or characters in the secret values",
+                        "Ensure you're using the correct secret for this webhook provider"
+                    ]
+                )
+                error_message = errors.format_user_error(error, include_technical=False)
+            else:
+                error_message = None
         else:
-            valid, why = False, "no signature supplied"
+            error = errors.ActionableError(
+                category=errors.ErrorCategory.VALIDATION,
+                code="RAVEN-907",
+                message="No webhook signature supplied",
+                user_guidance=[
+                    "Configure your webhook provider to send signature headers for security",
+                    "Refer to your provider's documentation on how to enable webhook signatures",
+                    "Without signature verification, anyone could send fake payment notifications"
+                ]
+            )
+            error_message = errors.format_user_error(error, include_technical=False)
 
         if not valid:
             logger.warning("rejected payment webhook: %s", why)
-            return JSONResponse({"ok": False, "error": why}, status_code=400)
+            errors.log_actionable_error(error, context="webhook signature verification") if 'error' in locals() else None
+            return JSONResponse({"ok": False, "error": error_message}, status_code=400)
 
         try:
             payload = json.loads(body.decode("utf-8"))
