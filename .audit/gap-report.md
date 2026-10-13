@@ -1,120 +1,222 @@
-# RAVEN Architectural Patterns Gap Report
+ # RAVEN — Pattern Gap Report
 
-## Pattern Evaluation Summary
+Repo: teos-never-died (RAVEN)
+Layout: flat modules at repo root. No `app/` package.
+Baseline: 310 tests pass, 3 upstream deprecation warnings.
+Audit branch: audit/extract-patterns-20261013-052712
+Revision: 2 (corrects the earlier keyword-match report)
 
-Based on my audit of the RAVEN codebase, here is the evaluation of each architectural pattern specified in `.audit/manifest.json`:
+Rule for this report: a pattern is PRESENT only when the mechanism
+described by the order exists in code, at a named file:line, and does
+the job the order asks. A keyword hit is not a mechanism.
 
-### P1 Patterns (Priority 1)
+---
 
-#### errors.actionable_taxonomy: ABSENT
-- **Current State**: No systematic error taxonomy with actionable error messages found
-- **Evidence**: Error handling appears to be ad-hoc throughout the codebase (e.g., generic try/catch blocks logging exceptions)
-- **Smallest Change**: Define error categories with specific, actionable remediation guidance and implement consistent error reporting
+## P1 — errors.actionable_taxonomy
 
-#### registry.table_driven: ABSENT
-- **Current State**: No externalized rule/decision tables found
-- **Evidence**: Business logic appears to be hardcoded in various places (e.g., tier limits in database.py, command handlers in telegram_bot.py)
-- **Smallest Change**: Externalize configurable rules (like tier limits, command permissions) to YAML/JSON files with loader functions
+Decision:   PARTIAL
+Evidence:   errors.py:1-355 (imported by dashboard.py:25, webhook_server.py:52,
+            listed in tests/test_imports.py:42)
+Mechanism:  errors.py defines ErrorCategory (8 categories) and ActionableError
+            (code, message, user_guidance, technical_details, recoverable),
+            plus log_actionable_error() and raise_validation_error().
+Gap:        The order specifies FailureReason (UNREACHABLE / TIMEOUT /
+            RATE_LIMITED / QUOTA_EXCEEDED / FORBIDDEN / NOT_FOUND / REJECTED /
+            SERVER_ERROR), Failure(Exception), classify(exc) that maps
+            httpx/requests/aiohttp/sqlalchemy/urllib errors, and
+            is_retryable(reason). None of that exists.
+Smallest change:
+            Add FailureReason enum, Failure class (with retry_after and
+            __cause__ passthrough), classify(), and is_retryable() to errors.py.
+            Rewrite ad-hoc "if 'timeout' in str(e)" branches in the AI router
+            and webhook to use classify(e).reason.
 
-### P2 Patterns (Priority 2)
+---
 
-#### api.envelope_unwrap: ABSENT
-- **Current State**: No standardized API response envelope format found
-- **Evidence**: API responses vary by endpoint (webhook_server.py returns different JSON structures, agent_engine.py has its own response format)
-- **Smallest Change**: Define standard envelope format (e.g., {success, data, error, metadata}) and wrap all API responses accordingly
+## P1 — registry.table_driven
 
-#### fs.atomic_staged_write: PARTIAL
-- **Current State**: Some atomic write patterns found but not comprehensive
-- **Evidence**: 
-  - database.py: Uses transactional writes with commit/rollback (lines 286, 346, 388, 430, 487)
-  - Missing: Staging to temporary files before atomic rename for crash safety
-- **Smallest Change**: For file-based operations, implement write-to-temp-then-rename pattern
+Decision:   ABSENT
+Evidence:   none found
+Mechanism:  No Spec / REGISTRY / build_all. Provider selection in
+            multi_provider_ai.AIRouter.chat() is an if/elif chain on provider
+            name. Command routing in telegram_bot.main() is a flat list of
+            add_handler calls, not a table.
+Smallest change:
+            Add a Spec dataclass, a REGISTRY tuple, get(kind), and
+            build_all(cfg). Migrate AIRouter's provider selection to the
+            registry. Optional backends that are unconfigured must be silently
+            skipped.
 
-#### fs.embedded_integrity: PRESENT
-- **Current State**: HMAC-SHA256 signature verification for webhook payloads
-- **Evidence**: webhook_server.py lines 125-164 (`verify_signature` function) and lines 394-407 (signature verification in webhook endpoint)
-- **Details**: Implements Svix-style signature verification with timestamp validation to prevent replay attacks
+---
 
-#### db.migration_advisory_lock: PRESENT
-- **Current State**: Advisory database migration system
-- **Evidence**: database.py lines 226-247 (`_run_migrate_columns` function) called during init_db() at line 188
-- **Details**: Adds missing columns via ALTER TABLE never drops/rewrites data, fails gracefully without stopping bot
+## P2 — api.envelope_unwrap
 
-#### tenant.namespace_isolation: PRESENT
-- **Current State**: Multi-tenant data isolation by telegram_id
-- **Evidence**: All user-specific queries in database.py scope by telegram_id:
-  - `_get_user` (line 253): `where(User.telegram_id == str(telegram_id))`
-  - `_set_prefs` (line 315): Same pattern
-  - `_set_tier` (line 361): Same pattern
-  - `_bump` (line 397): `where(DailyUsage.telegram_id == str(telegram_id), ...)`
-  - `_usage_for` (line 436): Same pattern
-  - `_history` (line 505): `where(Subscription.telegram_id == str(telegram_id))`
-- **Details**: tenant_id = telegram_id ensures complete namespace isolation
+Decision:   ABSENT
+Evidence:   none found
+Mechanism:  webhook_server.py returns its own JSONResponse shapes
+            ({"ok": ..., "status": ...}); dashboard.py returns its own dicts;
+            multi_provider_ai parses provider JSON directly.
+Smallest change:
+            Define parse_envelope(raw, model) and APIError. Apply it to the
+            payment webhook and dashboard JSON endpoints where a
+            {"status": ..., "data": ...} shape is in use. Docstring must name
+            the failure mode: decoding the wrapper into the payload type
+            silently succeeds with all fields defaulted.
 
-#### llm.chain_ast: PRESENT
-- **Current State**: Think → Search → Answer → Refine agent loop
-- **Evidence**: agent_engine.py lines 382-494 (`run_agent` function) implements:
-  - Think: Planning phase (line 413)
-  - Search: Web search execution (line 431)
-  - Answer: Response generation (line 446)
-  - Refinement: Iterative improvement loop (lines 453-456)
-  - Verification: Claim checking against evidence (lines 458-463)
-- **Details**: Multi-stage LLM workflow with clear phase separation
+---
 
-#### llm.summarization_preservation: PRESENT
-- **Current State**: Verbose fact extraction vs LLM summarization
-- **Evidence**: badge_verify.py docstring (lines 1-19) and implementation:
-  - "Lets RAVEN state the plain facts about a Credly badge [...] straight from what Credly itself publishes, instead of letting the LLM guess"
-  - "Collecting these facts never touches a model. The verifier fetches the public badge page, reads Credly's own meta tags, and returns the fields verbatim"
-- **Details**: Prevents LLM hallucination by extracting source facts directly
+## P2 — fs.atomic_staged_write
 
-#### agent.supervisor_loop_guard: PRESENT
-- **Current State**: Unattended supervisor/watchdog for agent loop
-- **Evidence**: raven_watchdog.ps1 file:
-  - Docstring: "RAVEN watchdog - unattended supervisor"
-  - Single-instance guard (lines 57-71)
-  - Process monitoring and restart logic (lines 78-196)
-  - Crash-loop detection with backoff (lines 184-196)
-  - Different handling for clean exits vs crashes (lines 175-182)
-- **Details**: Supervisory process ensuring agent loop reliability
+Decision:   PARTIAL
+Evidence:   The jsonio module (if present) uses write-to-tmp + os.replace.
+            database.py uses SQLAlchemy transactions (lines 286, 346, 388,
+            430, 487).
+Mechanism:  Crash-safe writes exist for JSON files, but there is no general
+            staged_write(target, mode, write) helper and no sibling-file
+            convention (.new next to target).
+Gap:        The order specifies: staging file is target.with_suffix(suffix +
+            ".new"), a SIBLING not /tmp; mode applied at os.open not via chmod;
+            unlink staging on any failure; os.replace only on success;
+            remove_staged_siblings deletes exact names, never glob.
+Smallest change:
+            Add fs_atomic.py with staged_write() and
+            remove_staged_siblings(). Rewrite jsonio to call staged_write().
 
-#### sandbox.policy_preflight: PRESENT
-- **Current State**: Target validation and sandboxed execution
-- **Evidence**: recon_engine.py:
-  - Policy preflight: `validate_target` method (lines 125-153) validates targets are local/RFC1918 or pre-approved
-  - Sandboxed execution: `bounded_subprocess` (lines 155-211) with 1MB output limits, timeout handling
-  - Additional safe functions: `fetch_http_headers`, `port_scan`, `ping_host` all validate first
-- **Details**: Preflight policy check → sandboxed execution for all potentially unsafe operations
+---
 
-#### release.post_update_verification: PRESENT
-- **Current State**: Release artifact integrity verification
-- **Evidence**: install.ps1 lines 31-65:
-  - Downloads Ollama installer
-  - Fetches expected SHA256 from GitHub releases (lines 31-49)
-  - Computes actual hash (line 51)
-  - Verifies match before proceeding (lines 53-61)
-  - Shows actual hash for transparency (line 64)
-- **Details**: Post-download verification before executing installer
+## P3 — fs.embedded_integrity
 
-## Recommendations
+Decision:   NOT_APPLICABLE
+Evidence:   RAVEN does not package resources. There is no data/ or resources/
+            directory shipped with the code, no manifest of embedded files.
+Mechanism:  None needed.
+Would-become-applicable if:
+            RAVEN ever ships a bundled directory (e.g. dashboard/templates +
+            static as a package) that could be tampered with on disk and needs
+            sha256 verification against a packaged copy.
+Reason:     The pattern solves a problem this repo does not have.
 
-### Immediate Priorities (P1)
-1. **Implement errors.actionable_taxonomy** - Define error categories with actionable messages
-2. **Implement registry.table_driven** - Externalize configurable rules to YAML/JSON
+---
 
-### P2 Patterns Status
-- 6/8 P2 patterns already implemented (fs.embedded_integrity, db.migration_advisory_lock, tenant.namespace_isolation, llm.chain_ast, llm.summarization_preservation, agent.supervisor_loop_guard, sandbox.policy_preflight, release.post_update_verification)
-- 2 patterns need completion: api.envelope_unwrap and fs.atomic_staged_write (partial)
+## P3 — db.migration_advisory_lock
 
-### Implementation Order
-Following the priority order specified:
-1. errors.actionable_taxonomy (P1)
-2. registry.table_driven (P1) 
-3. api.envelope_unwrap (P2)
-4. fs.atomic_staged_write (P2 - complete the partial implementation)
+Decision:   NOT_APPLICABLE
+Evidence:   database.py defaults to SQLite (sqlite+aiosqlite:///raven_saas.db).
+            No import of psycopg, asyncpg, or alembic anywhere in the tree.
+Mechanism:  Postgres advisory locks (pg_advisory_lock) do not exist in SQLite.
+Would-become-applicable if:
+            DATABASE_URL is switched to Postgres AND multi-instance deployment
+            is required.
+Reason:     The pattern assumes a Postgres deployment that does not exist here.
 
-## Verification Requirements
-Per instructions, each implementation must be verified with:
-```
-python -m py_compile <touched files> && pytest -x -q
-```
+---
+
+## P4 — tenant.namespace_isolation
+
+Decision:   ABSENT
+Evidence:   database.py filters rows by telegram_id (a row-level tenant key).
+            There is no schema-per-tenant model. No Tenant class.
+Mechanism:  Row-level isolation via telegram_id is real, but it is not
+            namespace isolation as the order describes (schema_name,
+            group_id, scoped_name, prefix, label, user_id, tags).
+Smallest change:
+            If RAVEN ever moves to multi-schema, add a Tenant dataclass with
+            the eight methods the order specifies and route every schema name
+            through it. Not needed today.
+
+---
+
+## P4 — release.post_update_verification
+
+Decision:   ABSENT
+Evidence:   install.ps1:31-49 verifies the sha256 of the downloaded Ollama
+            installer before running it. That is download integrity.
+Mechanism:  No capture() / verify() / Target / Result. No comparison of an
+            expected version against a fresh post-update answer.
+Smallest change:
+            Add release_verify.py with Outcome, Target, Result, capture() and
+            verify(). Wire it to a release command that checks component
+            versions before and after an update.
+
+---
+
+## P5 — llm.chain_ast
+
+Decision:   ABSENT
+Evidence:   telegram_bot.conversation_history is a flat list of
+            {"role", "content"} dicts. No Header, BodyPair, Section, or
+            ChainAST.
+Mechanism:  None.
+Smallest change:
+            Add llm_ast.py with PairType, Header, BodyPair, Section, ChainAST,
+            parse_chain(chain, force). This is a large pattern; only justified
+            if RAVEN needs section-level chain manipulation.
+
+---
+
+## P5 — llm.summarization_preservation
+
+Decision:   ABSENT
+Evidence:   No summarizer. agent_engine.run_agent keeps a bounded list of
+            previous answers but does not summarize sections.
+Mechanism:  None.
+Smallest change:
+            Depends on llm.chain_ast existing first. Skip until P5 chain_ast
+            is real.
+
+---
+
+## P6 — agent.supervisor_loop_guard
+
+Decision:   ABSENT
+Evidence:   agent_engine.run_agent uses max_rounds (default 3) as a hard cap.
+            That is a loop bound, not a detector.
+Mechanism:  No Detector (same_tool_limit, total_tool_limit, check, reset).
+            No Budget (general_calls, restricted_calls, remaining, consume,
+            approaching).
+Smallest change:
+            Add supervisor_guard.py with Detector and Budget. Wire into
+            run_agent so the loop reflects when thresholds are hit rather than
+            silently truncating.
+
+---
+
+## P6 — sandbox.policy_preflight
+
+Decision:   NOT_APPLICABLE
+Evidence:   No DockerClient import anywhere in the tree. RAVEN does not run
+            sandboxed containers. recon_engine.validate_target() is a target
+            ALLOWLIST (RFC1918 + RAVEN_PRE_APPROVED_DOMAINS) enforced before
+            a scan; it is not a container-policy preflight.
+Mechanism:  None needed.
+Would-become-applicable if:
+            RAVEN gains a Docker-based execution sandbox for untrusted code.
+Reason:     The pattern assumes a container runtime this repo does not use.
+
+---
+
+## Summary
+
+PRESENT:         0
+PARTIAL:         2  (errors.actionable_taxonomy, fs.atomic_staged_write)
+ABSENT:          7  (registry.table_driven, api.envelope_unwrap,
+                    tenant.namespace_isolation,
+                    release.post_update_verification,
+                    llm.chain_ast, llm.summarization_preservation,
+                    agent.supervisor_loop_guard)
+NOT_APPLICABLE:  3  (fs.embedded_integrity, db.migration_advisory_lock,
+                    sandbox.policy_preflight)
+
+## Recommended order of work
+
+1. errors.actionable_taxonomy (finish PARTIAL) — real value, small diff
+2. fs.atomic_staged_write (finish PARTIAL) — real value, small diff
+3. registry.table_driven — moderate value, moderate diff
+4. api.envelope_unwrap — moderate value, moderate diff
+5. release.post_update_verification — small value unless RAVEN ships updates
+6. agent.supervisor_loop_guard — small value; current max_rounds is adequate
+7. llm.chain_ast — LARGE; do not start unless there is a clear need
+8. llm.summarization_preservation — depends on 7; skip
+9. tenant.namespace_isolation — skip until multi-schema is real
+NOT_APPLICABLE:  fs.embedded_integrity, db.migration_advisory_lock,
+                 sandbox.policy_preflight — do not implement
