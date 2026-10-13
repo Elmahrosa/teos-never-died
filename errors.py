@@ -353,3 +353,163 @@ def raise_validation_error(field: str, message: str, guidance: List[str],
         user_guidance=guidance,
         technical_details=technical_details
     )
+
+
+class FailureReason(str, Enum):
+    UNREACHABLE = "unreachable"
+    TIMEOUT = "timeout"
+    RATE_LIMITED = "rate_limited"
+    QUOTA_EXCEEDED = "quota_exceeded"
+    FORBIDDEN = "forbidden"
+    NOT_FOUND = "not_found"
+    REJECTED = "rejected"
+    SERVER_ERROR = "server_error"
+
+
+class Failure(Exception):
+    def __init__(self, reason: FailureReason, message: str, *,
+                 retry_after: float = 0.0, cause: BaseException | None = None):
+        self.reason = reason
+        self.message = message
+        self.retry_after = retry_after
+        super().__init__(message)
+        if cause is not None:
+            self.__cause__ = cause
+
+
+def is_retryable(reason: FailureReason) -> bool:
+    RETRYABLE = {
+        FailureReason.UNREACHABLE,
+        FailureReason.TIMEOUT,
+        FailureReason.RATE_LIMITED,
+        FailureReason.QUOTA_EXCEEDED,
+        FailureReason.SERVER_ERROR,
+    }
+    return reason in RETRYABLE
+
+
+def classify(exc: BaseException) -> Failure | None:
+    # Rule a: If the exception (or any attribute chain) carries a Retry-After header or a retry_after attribute, match RATE_LIMITED FIRST
+    retry_after = getattr(exc, "retry_after", None)
+    response = getattr(exc, "response", None)
+    headers = None
+    if response is not None:
+        headers = getattr(response, "headers", None)
+    retry_after_header = None
+    if headers is not None:
+        retry_after_header = headers.get("Retry-After") or headers.get("retry-after")
+    # Determine if we have a retry_after signal (attribute or header)
+    has_retry_after_signal = False
+    retry_after_val = 0.0
+    if retry_after is not None:
+        try:
+            v = float(retry_after)
+            if v >= 0:
+                has_retry_after_signal = True
+                retry_after_val = v
+        except (ValueError, TypeError):
+            pass
+    if not has_retry_after_signal and retry_after_header is not None:
+        try:
+            v = float(retry_after_header)
+            if v >= 0:
+                has_retry_after_signal = True
+                retry_after_val = v
+        except (ValueError, TypeError):
+            pass
+    if has_retry_after_signal:
+        return Failure(FailureReason.RATE_LIMITED, str(exc), retry_after=retry_after_val, cause=exc)
+
+    # Rule b: Match by type, defensively
+    exc_type = type(exc)
+    exc_name = exc_type.__name__
+    # Check for Timeout
+    if "Timeout" in exc_name:
+        return Failure(FailureReason.TIMEOUT, str(exc), cause=exc)
+    # Check for Connect, Connection, NameResolution
+    if any(name in exc_name for name in ("Connect", "Connection", "NameResolution")):
+        return Failure(FailureReason.UNREACHABLE, str(exc), cause=exc)
+    # Check for RateLimit or TooManyRequests
+    if "RateLimit" in exc_name or "TooManyRequests" in exc_name:
+        return Failure(FailureReason.RATE_LIMITED, str(exc), cause=exc)
+    # Check for Forbidden / PermissionDenied / Unauthorized
+    if any(name in exc_name for name in ("Forbidden", "PermissionDenied", "Unauthorized")):
+        return Failure(FailureReason.FORBIDDEN, str(exc), cause=exc)
+    # Check for NotFound
+    if "NotFound" in exc_name:
+        return Failure(FailureReason.NOT_FOUND, str(exc), cause=exc)
+    # Check for Rejected
+    if "Rejected" in exc_name:
+        return Failure(FailureReason.REJECTED, str(exc), cause=exc)
+    # SQLAlchemy errors
+    if exc_name.endswith("Error") and ("OperationalError" in exc_name or "InterfaceError" in exc_name or "DatabaseError" in exc_name):
+        # Assuming sqlalchemy exceptions; we match by name only
+        return Failure(FailureReason.UNREACHABLE, str(exc), cause=exc)
+    # HTTP status attribute
+    status = getattr(exc, "status", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            status = getattr(response, "status", None)
+    if status is not None:
+        try:
+            status_code = int(status)
+            if status_code == 429:
+                return Failure(FailureReason.RATE_LIMITED, str(exc), cause=exc)
+            if status_code == 403 or status_code == 401:
+                return Failure(FailureReason.FORBIDDEN, str(exc), cause=exc)
+            if status_code == 404:
+                return Failure(FailureReason.NOT_FOUND, str(exc), cause=exc)
+            if status_code >= 500:
+                return Failure(FailureReason.SERVER_ERROR, str(exc), cause=exc)
+        except (ValueError, TypeError):
+            pass
+    # Rule c: If nothing matches, return None
+    return None
+
+    # Rule b: Match by type, defensively
+    exc_type = type(exc)
+    exc_name = exc_type.__name__
+    # Check for Timeout
+    if "Timeout" in exc_name:
+        return Failure(FailureReason.TIMEOUT, str(exc), cause=exc)
+    # Check for Connect, Connection, NameResolution
+    if any(name in exc_name for name in ("Connect", "Connection", "NameResolution")):
+        return Failure(FailureReason.UNREACHABLE, str(exc), cause=exc)
+    # Check for RateLimit or TooManyRequests
+    if "RateLimit" in exc_name or "TooManyRequests" in exc_name:
+        return Failure(FailureReason.RATE_LIMITED, str(exc), cause=exc)
+    # Check for Forbidden / PermissionDenied / Unauthorized
+    if any(name in exc_name for name in ("Forbidden", "PermissionDenied", "Unauthorized")):
+        return Failure(FailureReason.FORBIDDEN, str(exc), cause=exc)
+    # Check for NotFound
+    if "NotFound" in exc_name:
+        return Failure(FailureReason.NOT_FOUND, str(exc), cause=exc)
+    # Check for Rejected
+    if "Rejected" in exc_name:
+        return Failure(FailureReason.REJECTED, str(exc), cause=exc)
+    # SQLAlchemy errors
+    if exc_name.endswith("Error") and ("OperationalError" in exc_name or "InterfaceError" in exc_name or "DatabaseError" in exc_name):
+        # Assuming sqlalchemy exceptions; we match by name only
+        return Failure(FailureReason.UNREACHABLE, str(exc), cause=exc)
+    # HTTP status attribute
+    status = getattr(exc, "status", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            status = getattr(response, "status", None)
+    if status is not None:
+        try:
+            status_code = int(status)
+            if status_code == 429:
+                return Failure(FailureReason.RATE_LIMITED, str(exc), cause=exc)
+            if status_code == 403 or status_code == 401:
+                return Failure(FailureReason.FORBIDDEN, str(exc), cause=exc)
+            if status_code == 404:
+                return Failure(FailureReason.NOT_FOUND, str(exc), cause=exc)
+            if status_code >= 500:
+                return Failure(FailureReason.SERVER_ERROR, str(exc), cause=exc)
+        except (ValueError, TypeError):
+            pass
+    # Rule c: If nothing matches, return None
+    return None
