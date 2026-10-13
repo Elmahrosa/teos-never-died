@@ -1,6 +1,7 @@
 import asyncio
 import os
 from dotenv import load_dotenv
+_trade_lock = asyncio.Lock()
 
 # Load environment variables from .env file
 load_dotenv()
@@ -2992,11 +2993,12 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE, side
         except ValueError:
             raise ValueError("Amount must be a number, e.g. /buy BTC 100")
 
-        ok, reason = TRADING.check_risk(side, symbol, amount)
-        if not ok:
-            raise ValueError(f"🚫 Blocked: {reason}")
+        async with _trade_lock:
+            ok, reason = TRADING.check_risk(side, symbol, amount)
+            if not ok:
+                raise ValueError(f"🚫 Blocked: {reason}")
 
-        receipt = TRADING.execute(side, symbol, amount, update.effective_user.id)
+            receipt = TRADING.execute(side, symbol, amount, update.effective_user.id)
         tag = "LIVE" if receipt["mode"] == "live" else "PAPER"
         return f"""✅ [{tag}] {side.upper()} {receipt['symbol']}\n
    ${receipt['amount_usdt']:,.2f} @ {receipt['price']:,.2f}\n
