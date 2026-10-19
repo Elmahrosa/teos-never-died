@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "teos-gateway": {
+      "command": "python",
+      "args": ["C:\\Users\\aams1\\teos-mcp\\server.py"]
+    }
+  }
+}
